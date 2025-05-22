@@ -73,20 +73,23 @@ app.post("/api/chat", async (req, res) => {
 
   try {
     const usageSnap = await usageRef.get();
-    const usageData = usageSnap.data();
+    let usageData = null;
+    let resetToday = true;
 
-    if (
-      !usageSnap.exists ||
-      !usageData.lastReset ||
-      usageData.lastReset.toDate().toDateString() !== today
-    ) {
+    if (usageSnap.exists) {
+      usageData = usageSnap.data();
+      const lastReset = usageData.lastReset?.toDate().toDateString?.();
+      resetToday = lastReset !== today;
+    }
+
+    if (resetToday) {
       await usageRef.set({
         tokensUsed: 0,
-        lastReset: Timestamp.now(), // ✅ Timestamp instead of plain string
+        lastReset: Timestamp.now(),
       });
       tokensUsed = 0;
     } else {
-      tokensUsed = usageData.tokensUsed || 0;
+      tokensUsed = usageData?.tokensUsed || 0;
     }
   } catch (err) {
     console.error("🔥 Firestore usage fetch error:", err.message);
