@@ -1,138 +1,148 @@
-const express = require("express");
-const cors = require("cors");
-const dotenv = require("dotenv");
-const OpenAI = require("openai");
-const admin = require("firebase-admin");
-const serviceAccount = require("./serviceAccountKey.json");
+import React, { useContext, useState, useEffect } from "react";
+import axios from "axios";
+import { AuthContext } from "../context/AuthProvider";
+import { db } from "../firebase";
+import { doc, getDoc } from "firebase/firestore";
 
-// Load environment variables
-dotenv.config();
+const ChatTester = ({ faqs }) => {
+  const { user } = useContext(AuthContext);
 
-// Initialize Firebase Admin SDK
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-const db = admin.firestore();
+  const [userQ, setUserQ] = useState("");
+  const [botAnswer, setBotAnswer] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [tokensUsed, setTokensUsed] = useState(0);
+  const [dailyLimit, setDailyLimit] = useState(2000);
+  const [tier, setTier] = useState("free");
 
-// Initialize Express app
-const app = express();
-const PORT = process.env.PORT || 5000;
+  const percentUsed = Math.min(100, Math.round((tokensUsed / dailyLimit) * 100));
+  const isNearLimit = percentUsed >= 90;
 
-app.use(cors());
-app.use(express.json());
+  const getPlanName = () => {
+    if (tier === "pro") return "Pro";
+    if (tier === "unlimited") return "Unlimited";
+    return "Free";
+  };
 
-// DeepSeek-compatible OpenAI client
-const openai = new OpenAI({
-  apiKey: process.env.DEEPSEEK_API_KEY,
-  baseURL: "https://api.deepseek.com",
-});
+  // ✅ Fetch tier + token usage on mount
+  useEffect(() => {
+    const fetchUserData = async () => {
+      if (!user?.uid) return;
 
-// Estimate token usage (approx 1 token ≈ 4 characters)
-function estimateTokenCount(text) {
-  return Math.ceil(text.length / 4);
-}
+      try {
+        const userRef = doc(db, "users", user.uid);
+        const userSnap = await getDoc(userRef);
+        if (userSnap.exists()) {
+          const userData = userSnap.data();
+          const firestoreTier = userData.tier || "free";
+          setTier(firestoreTier);
 
-// Test route
-app.get("/", (req, res) => {
-  res.send("API is running...");
-});
+          if (firestoreTier === "pro") setDailyLimit(5000);
+          else if (firestoreTier === "unlimited") setDailyLimit(999999);
+          else setDailyLimit(2000);
+        }
 
-// Chat route
-app.post("/api/chat", async (req, res) => {
-  console.log("📩 /api/chat route hit!");
-  const { question, faqs } = req.body;
-  const userId = req.headers["x-user-id"] || "test-user";
+        const usageRef = doc(db, "usage", user.uid);
+        const usageSnap = await getDoc(usageRef);
+        if (usageSnap.exists()) {
+          const usageData = usageSnap.data();
+          const today = new Date().toDateString().trim();
+          const lastReset = (usageData.lastReset || "").toString().trim();
 
-  if (!question || !faqs || !Array.isArray(faqs)) {
-    return res.status(400).json({ error: "Missing question or FAQs." });
-  }
+          if (lastReset === today) {
+            setTokensUsed(usageData.tokensUsed || 0);
+          } else {
+            console.warn("⏳ Different date detected. Resetting usage.");
+            setTokensUsed(0);
+          }
+        }
+      } catch (err) {
+        console.warn("❌ Error fetching user data from Firestore:", err.message);
+      }
+    };
 
-  // 🔓 Fetch user tier and set daily token limit
-  let DAILY_LIMIT = 2000;
-  let tier = "free";
+    fetchUserData();
+  }, [user]);
 
-  try {
-    console.log("🔎 Fetching Firestore userId:", userId); // ✅ Log the ID
-    const userDoc = await db.collection("users").doc(userId).get();
+  const testChat = async () => {
+    setLoading(true);
+    setBotAnswer("");
 
-    console.log("📄 Firestore doc data:", userDoc.data()); // ✅ Log full doc
+    try {
+      const res = await axios.post(
+        `${import.meta.env.VITE_API_BASE_URL}/api/chat`,
+        {
+          question: userQ,
+          faqs: faqs,
+        },
+        {
+          headers: {
+            "x-user-id": user?.uid || "guest-user",
+          },
+        }
+      );
 
-    if (userDoc.exists) {
-      tier = userDoc.data().tier || "free";
+      setBotAnswer(res.data.reply);
+      setTokensUsed(res.data.tokensUsed);
+      setDailyLimit(res.data.dailyLimit);
+      setTier(res.data.tier || "free");
+      console.log("🔁 Tier from backend:", res.data.tier);
+    } catch (err) {
+      setBotAnswer(err.response?.data?.error || "❌ Error getting response.");
+    } finally {
+      setLoading(false);
     }
+  };
 
-    if (tier === "pro") DAILY_LIMIT = 5000;
-    else if (tier === "unlimited") DAILY_LIMIT = 999999;
-  } catch (e) {
-    console.warn("⚠️ Failed to fetch user tier, using default limit:", e.message);
-  }
+  return (
+    <div className="bg-white rounded-xl shadow p-6 space-y-4">
+      <h2 className="text-xl font-semibold text-pink-600">🤖 Test Chatbot</h2>
 
+      {isNearLimit && (
+        <div className="p-3 bg-yellow-100 border-l-4 border-yellow-500 text-yellow-800 text-sm rounded">
+          ⚠️ You’ve used {percentUsed}% of your daily token limit. You may be blocked soon.
+        </div>
+      )}
 
-  const today = new Date().toDateString();
-  const usageRef = db.collection("usage").doc(userId);
-  let tokensUsed = 0;
+      <div className="flex flex-col md:flex-row gap-4">
+        <input
+          type="text"
+          className="border px-4 py-2 rounded w-full focus:ring-2 focus:ring-pink-300"
+          placeholder="Ask something..."
+          value={userQ}
+          onChange={(e) => setUserQ(e.target.value)}
+        />
+        <button
+          onClick={testChat}
+          disabled={loading}
+          className="bg-pink-600 text-white px-5 py-2 rounded hover:bg-pink-700"
+        >
+          {loading ? "Thinking..." : "💬 Ask Bot"}
+        </button>
+      </div>
 
-  try {
-    const usageSnap = await usageRef.get();
-    if (!usageSnap.exists || usageSnap.data().lastReset !== today) {
-      await usageRef.set({ tokensUsed: 0, lastReset: today });
-    } else {
-      tokensUsed = usageSnap.data().tokensUsed || 0;
-    }
-  } catch (err) {
-    console.error("🔥 Firestore usage fetch error:", err.message);
-    return res.status(500).json({ error: "Failed to fetch usage data." });
-  }
+      {botAnswer && (
+        <div className="p-4 bg-pink-50 border border-pink-200 rounded text-gray-800">
+          <strong className="text-pink-800">Bot:</strong>
+          <p className="mt-1 whitespace-pre-wrap">{botAnswer}</p>
+        </div>
+      )}
 
-  const formattedFAQ = faqs
-    .map((item, index) => `${index + 1}. Q: ${item.q} A: ${item.a}`)
-    .join("\n");
+      <div className="mt-4 space-y-1">
+        <div className="text-sm font-medium text-gray-600">
+          Token Usage: {tokensUsed} / {dailyLimit}
+        </div>
+        <p className="text-xs italic text-gray-500">Plan: {getPlanName()}</p>
+        <div className="w-full bg-gray-200 rounded-full h-3">
+          <div
+            className={`h-3 rounded-full transition-all duration-500 ${
+              percentUsed >= 100 ? "bg-red-500" : "bg-green-500"
+            }`}
+            style={{ width: `${percentUsed}%` }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+};
 
-  const prompt = `
-You are an AI customer support assistant. Use the following FAQs to answer the user's question.
-
-FAQs:
-${formattedFAQ}
-
-User's Question: ${question}
-Answer:
-  `;
-
-  const estimatedPromptTokens = estimateTokenCount(prompt);
-  const estimatedOutputTokens = 100;
-  const totalEstimated = estimatedPromptTokens + estimatedOutputTokens;
-
-  if (tokensUsed + totalEstimated > DAILY_LIMIT) {
-    return res.status(403).json({ error: "❌ Token limit exceeded for today. Try again tomorrow." });
-  }
-
-  try {
-    const completion = await openai.chat.completions.create({
-      model: "deepseek-chat",
-      messages: [{ role: "user", content: prompt }],
-    });
-
-    const reply = completion.choices[0].message.content;
-    const replyTokens = estimateTokenCount(reply);
-    const updatedTokens = tokensUsed + estimatedPromptTokens + replyTokens;
-
-    await usageRef.update({ tokensUsed: updatedTokens });
-
-    console.log("📦 Sending tier back to frontend:", tier);
-
-    res.json({
-      reply,
-      tokensUsed: updatedTokens,
-      dailyLimit: DAILY_LIMIT,
-      tier: tier || "free", // send back user's plan
-    });
-
-  } catch (err) {
-    const errorResponse = err.response?.data || err.message || err;
-    console.error("❌ DeepSeek API Error:", JSON.stringify(errorResponse, null, 2));
-    res.status(500).json({ error: "Failed to generate response.", debug: errorResponse });
-  }
-});
-
-// Start the server
-app.listen(PORT, () => console.log(`✅ Server started on port ${PORT}`));
+export default ChatTester;
