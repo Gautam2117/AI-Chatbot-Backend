@@ -3,42 +3,68 @@ const cors = require("cors");
 const dotenv = require("dotenv");
 const OpenAI = require("openai");
 const admin = require("firebase-admin");
+const Razorpay = require("razorpay");
 const { Timestamp } = require("firebase-admin").firestore;
 const serviceAccount = require("./serviceAccountKey.json");
 
-// Load environment variables
 dotenv.config();
 
-// Initialize Firebase Admin SDK
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
 
-// Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
 
-// DeepSeek-compatible OpenAI client
+// Razorpay Setup
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_SECRET,
+});
+
+// DeepSeek Setup
 const openai = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseURL: "https://api.deepseek.com",
 });
 
-// Estimate token usage (approx 1 token ≈ 4 characters)
 function estimateTokenCount(text) {
   return Math.ceil(text.length / 4);
 }
 
-// Test route
+// Test
 app.get("/", (req, res) => {
-  res.send("API is running...");
+  res.send("✅ AI Chatbot + Razorpay API running...");
 });
 
-// Chat route
+// Razorpay: Create Order
+app.post("/api/create-order", async (req, res) => {
+  const { amount, currency = "INR", receipt = `receipt_${Date.now()}` } = req.body;
+
+  const options = {
+    amount: amount * 100, // ₹100 => 10000 paise
+    currency,
+    receipt,
+  };
+
+  try {
+    const order = await razorpay.orders.create(options);
+    res.json({
+      orderId: order.id,
+      currency: order.currency,
+      amount: order.amount,
+    });
+  } catch (err) {
+    console.error("❌ Razorpay order error:", err.message);
+    res.status(500).json({ error: "Failed to create Razorpay order" });
+  }
+});
+
+// Chat
 app.post("/api/chat", async (req, res) => {
   console.log("📩 /api/chat route hit!");
   const { question, faqs } = req.body;
@@ -48,15 +74,11 @@ app.post("/api/chat", async (req, res) => {
     return res.status(400).json({ error: "Missing question or FAQs." });
   }
 
-  // 🔓 Fetch user tier and set daily token limit
   let DAILY_LIMIT = 2000;
   let tier = "free";
 
   try {
-    console.log("🔎 Fetching Firestore userId:", userId);
     const userDoc = await db.collection("users").doc(userId).get();
-    console.log("📄 Firestore doc data:", userDoc.data());
-
     if (userDoc.exists) {
       tier = userDoc.data().tier || "free";
     }
@@ -64,7 +86,7 @@ app.post("/api/chat", async (req, res) => {
     if (tier === "pro") DAILY_LIMIT = 5000;
     else if (tier === "unlimited") DAILY_LIMIT = 999999;
   } catch (e) {
-    console.warn("⚠️ Failed to fetch user tier, using default limit:", e.message);
+    console.warn("⚠️ Tier fetch failed:", e.message);
   }
 
   const today = new Date().toDateString();
@@ -92,7 +114,7 @@ app.post("/api/chat", async (req, res) => {
       tokensUsed = usageData?.tokensUsed || 0;
     }
   } catch (err) {
-    console.error("🔥 Firestore usage fetch error:", err.message);
+    console.error("🔥 Usage fetch error:", err.message);
     return res.status(500).json({ error: "Failed to fetch usage data." });
   }
 
@@ -108,7 +130,7 @@ ${formattedFAQ}
 
 User's Question: ${question}
 Answer:
-  `;
+`;
 
   const estimatedPromptTokens = estimateTokenCount(prompt);
   const estimatedOutputTokens = 100;
@@ -130,15 +152,12 @@ Answer:
 
     await usageRef.update({ tokensUsed: updatedTokens });
 
-    console.log("📦 Sending tier back to frontend:", tier);
-
     res.json({
       reply,
       tokensUsed: updatedTokens,
       dailyLimit: DAILY_LIMIT,
       tier: tier || "free",
     });
-
   } catch (err) {
     const errorResponse = err.response?.data || err.message || err;
     console.error("❌ DeepSeek API Error:", JSON.stringify(errorResponse, null, 2));
@@ -146,5 +165,4 @@ Answer:
   }
 });
 
-// Start the server
-app.listen(PORT, () => console.log(`✅ Server started on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
