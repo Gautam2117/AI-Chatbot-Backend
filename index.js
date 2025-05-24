@@ -22,9 +22,10 @@ app.use(express.json());
 
 // Razorpay Setup
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_SECRET,
+  key_id: process.env.RAZORPAY_KEY_ID || "rzp_test_dummy",
+  key_secret: process.env.RAZORPAY_SECRET || "test_dummy_secret",
 });
+
 
 // DeepSeek Setup
 const openai = new OpenAI({
