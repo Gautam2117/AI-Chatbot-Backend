@@ -26,7 +26,6 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_SECRET || "test_dummy_secret",
 });
 
-
 // DeepSeek Setup
 const openai = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
@@ -62,6 +61,24 @@ app.post("/api/create-order", async (req, res) => {
   } catch (err) {
     console.error("❌ Razorpay order error:", err.message);
     res.status(500).json({ error: "Failed to create Razorpay order" });
+  }
+});
+
+// 🔥 New: Upgrade Tier Endpoint
+app.post("/api/upgrade-tier", async (req, res) => {
+  const { userId, plan } = req.body;
+
+  if (!userId || !plan) {
+    return res.status(400).json({ error: "Missing userId or plan" });
+  }
+
+  try {
+    const userRef = db.collection("users").doc(userId);
+    await userRef.update({ tier: plan });
+    res.json({ success: true, message: `Tier updated to ${plan}` });
+  } catch (err) {
+    console.error("❌ Firestore upgrade error:", err.message);
+    res.status(500).json({ error: "Failed to upgrade tier" });
   }
 });
 
@@ -138,7 +155,9 @@ Answer:
   const totalEstimated = estimatedPromptTokens + estimatedOutputTokens;
 
   if (tokensUsed + totalEstimated > DAILY_LIMIT) {
-    return res.status(403).json({ error: "❌ Token limit exceeded for today. Try again tomorrow." });
+    // 🔥 Auto-downgrade on limit exceeded
+    await db.collection("users").doc(userId).update({ tier: "free" });
+    return res.status(403).json({ error: "❌ Token limit exceeded. You are downgraded to Free Plan. Upgrade to continue." });
   }
 
   try {
