@@ -4,6 +4,7 @@ const dotenv = require("dotenv");
 const OpenAI = require("openai");
 const admin = require("firebase-admin");
 const Razorpay = require("razorpay");
+const crypto = require("crypto");
 const { Timestamp } = require("firebase-admin").firestore;
 const serviceAccount = require("./serviceAccountKey.json");
 
@@ -43,12 +44,13 @@ app.get("/", (req, res) => {
 
 // Razorpay: Create Order
 app.post("/api/create-order", async (req, res) => {
-  const { amount, currency = "INR", receipt = `receipt_${Date.now()}` } = req.body;
+  const { amount, currency = "INR", receipt = `receipt_${Date.now()}`, userId, plan } = req.body;
 
   const options = {
     amount: amount * 100, // ₹100 => 10000 paise
     currency,
     receipt,
+    notes: { userId, plan }, // Attach userId and plan for webhook
   };
 
   try {
@@ -64,7 +66,43 @@ app.post("/api/create-order", async (req, res) => {
   }
 });
 
-// 🔥 New: Upgrade Tier Endpoint
+// Razorpay Webhook
+app.post("/api/razorpay-webhook", express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['x-razorpay-signature'];
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+
+  const expectedSignature = crypto
+    .createHmac('sha256', secret)
+    .update(req.body)
+    .digest('hex');
+
+  if (signature !== expectedSignature) {
+    console.warn("❌ Invalid webhook signature");
+    return res.status(400).send("Invalid signature");
+  }
+
+  const event = JSON.parse(req.body);
+
+  if (event.event === "payment.captured") {
+    const payment = event.payload.payment.entity;
+    const notes = payment.notes || {};
+    const userId = notes.userId;
+    const plan = notes.plan;
+
+    if (userId && plan) {
+      try {
+        await db.collection("users").doc(userId).update({ tier: plan });
+        console.log(`✅ Webhook: Upgraded ${userId} to ${plan}`);
+      } catch (err) {
+        console.error("🔥 Firestore upgrade error via webhook:", err.message);
+      }
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// 🔥 Old: Upgrade Tier via frontend (keep for test mode)
 app.post("/api/upgrade-tier", async (req, res) => {
   const { userId, plan } = req.body;
 
@@ -155,7 +193,6 @@ Answer:
   const totalEstimated = estimatedPromptTokens + estimatedOutputTokens;
 
   if (tokensUsed + totalEstimated > DAILY_LIMIT) {
-    // 🔥 Auto-downgrade on limit exceeded
     await db.collection("users").doc(userId).update({ tier: "free" });
     return res.status(403).json({ error: "❌ Token limit exceeded. You are downgraded to Free Plan. Upgrade to continue." });
   }
