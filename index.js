@@ -205,4 +205,29 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+// Razorpay Payment Verification API
+app.post("/api/verify-payment", async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ success: false, message: "Missing payment details." });
+  }
+
+  const secret = process.env.RAZORPAY_SECRET;
+
+  // Generate the expected signature
+  const generatedSignature = crypto
+    .createHmac("sha256", secret)
+    .update(razorpay_order_id + "|" + razorpay_payment_id)
+    .digest("hex");
+
+  if (generatedSignature === razorpay_signature) {
+    console.log("✅ Payment verification successful for order:", razorpay_order_id);
+    res.json({ success: true, message: "Payment verified successfully." });
+  } else {
+    console.warn("❌ Payment verification failed for order:", razorpay_order_id);
+    res.status(400).json({ success: false, message: "Invalid signature." });
+  }
+});
+
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
