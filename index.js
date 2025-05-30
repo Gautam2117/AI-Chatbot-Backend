@@ -37,22 +37,20 @@ function estimateTokenCount(text) {
   return Math.ceil(text.length / 4);
 }
 
-// Test
+// Test Endpoint
 app.get("/", (req, res) => {
   res.send("✅ AI Chatbot + Razorpay API running...");
 });
 
-// Razorpay: Create Order
+// Razorpay: Create Order (Updated with error logging)
 app.post("/api/create-order", async (req, res) => {
   const { amount, currency = "INR", receipt = `receipt_${Date.now()}`, userId, plan } = req.body;
-
   const options = {
-    amount: amount * 100, // ₹100 => 10000 paise
+    amount: amount * 100, // Convert ₹ to paise
     currency,
     receipt,
-    notes: { userId, plan }, // Attach userId and plan for webhook
+    notes: { userId, plan },
   };
-
   try {
     const order = await razorpay.orders.create(options);
     res.json({
@@ -61,58 +59,70 @@ app.post("/api/create-order", async (req, res) => {
       amount: order.amount,
     });
   } catch (err) {
-    console.error("❌ Razorpay order error:", err.message);
-    res.status(500).json({ error: "Failed to create Razorpay order" });
+    console.error("❌ Razorpay order error:", err.message, err);
+    res.status(500).json({ error: err.message || "Failed to create Razorpay order" });
   }
 });
 
-// Razorpay Webhook
+// Razorpay Webhook (Updated Signature Handling)
 app.post("/api/razorpay-webhook", express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-razorpay-signature'];
   const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  const generatedSignature = crypto.createHmac('sha256', secret).update(req.body).digest('hex');
 
-  const expectedSignature = crypto
-    .createHmac('sha256', secret)
-    .update(req.body)
-    .digest('hex');
-
-  if (signature !== expectedSignature) {
+  if (generatedSignature !== signature) {
     console.warn("❌ Invalid webhook signature");
     return res.status(400).send("Invalid signature");
   }
 
-  const event = JSON.parse(req.body);
+  let event;
+  try {
+    event = JSON.parse(req.body);
+  } catch (e) {
+    console.error("❌ Error parsing webhook payload:", e);
+    return res.status(400).send("Invalid payload");
+  }
 
+  console.log(`📢 Webhook Event: ${event.event}`);
+
+  // Handle payment.captured for plan upgrades
   if (event.event === "payment.captured") {
     const payment = event.payload.payment.entity;
     const notes = payment.notes || {};
     const userId = notes.userId;
     const plan = notes.plan;
-
     if (userId && plan) {
       try {
         await db.collection("users").doc(userId).update({ tier: plan });
         console.log(`✅ Webhook: Upgraded ${userId} to ${plan}`);
       } catch (err) {
-        console.error("🔥 Firestore upgrade error via webhook:", err.message);
+        console.error("🔥 Firestore upgrade error:", err.message);
       }
     }
+  }
+
+  // Handle optional events
+  else if (event.event === "payment.failed") {
+    console.warn("⚠️ Payment failed for payment_id:", event.payload.payment.entity.id);
+  } else if (event.event === "order.paid") {
+    console.log("💸 Order paid:", event.payload.order.entity.id);
+  } else if (event.event === "refund.processed") {
+    console.log("💸 Refund processed for:", event.payload.refund.entity.id);
+  } else if (event.event === "invoice.paid") {
+    console.log("🧾 Invoice paid:", event.payload.invoice.entity.id);
   }
 
   res.json({ received: true });
 });
 
-// 🔥 Old: Upgrade Tier via frontend (keep for test mode)
+// 🔥 Old: Upgrade Tier via Frontend (Optional for Testing)
 app.post("/api/upgrade-tier", async (req, res) => {
   const { userId, plan } = req.body;
-
   if (!userId || !plan) {
     return res.status(400).json({ error: "Missing userId or plan" });
   }
-
   try {
-    const userRef = db.collection("users").doc(userId);
-    await userRef.update({ tier: plan });
+    await db.collection("users").doc(userId).update({ tier: plan });
     res.json({ success: true, message: `Tier updated to ${plan}` });
   } catch (err) {
     console.error("❌ Firestore upgrade error:", err.message);
@@ -120,7 +130,7 @@ app.post("/api/upgrade-tier", async (req, res) => {
   }
 });
 
-// Chat
+// Chat Endpoint
 app.post("/api/chat", async (req, res) => {
   console.log("📩 /api/chat route hit!");
   const { question, faqs } = req.body;
@@ -135,10 +145,7 @@ app.post("/api/chat", async (req, res) => {
 
   try {
     const userDoc = await db.collection("users").doc(userId).get();
-    if (userDoc.exists) {
-      tier = userDoc.data().tier || "free";
-    }
-
+    if (userDoc.exists) tier = userDoc.data().tier || "free";
     if (tier === "pro") DAILY_LIMIT = 5000;
     else if (tier === "unlimited") DAILY_LIMIT = 999999;
   } catch (e) {
@@ -153,18 +160,13 @@ app.post("/api/chat", async (req, res) => {
     const usageSnap = await usageRef.get();
     let usageData = null;
     let resetToday = true;
-
     if (usageSnap.exists) {
       usageData = usageSnap.data();
       const lastReset = usageData.lastReset?.toDate().toDateString?.();
       resetToday = lastReset !== today;
     }
-
     if (resetToday) {
-      await usageRef.set({
-        tokensUsed: 0,
-        lastReset: Timestamp.now(),
-      });
+      await usageRef.set({ tokensUsed: 0, lastReset: Timestamp.now() });
       tokensUsed = 0;
     } else {
       tokensUsed = usageData?.tokensUsed || 0;
@@ -174,19 +176,8 @@ app.post("/api/chat", async (req, res) => {
     return res.status(500).json({ error: "Failed to fetch usage data." });
   }
 
-  const formattedFAQ = faqs
-    .map((item, index) => `${index + 1}. Q: ${item.q} A: ${item.a}`)
-    .join("\n");
-
-  const prompt = `
-You are an AI customer support assistant. Use the following FAQs to answer the user's question.
-
-FAQs:
-${formattedFAQ}
-
-User's Question: ${question}
-Answer:
-`;
+  const formattedFAQ = faqs.map((item, index) => `${index + 1}. Q: ${item.q} A: ${item.a}`).join("\n");
+  const prompt = `You are an AI customer support assistant. Use the following FAQs to answer the user's question.\n\nFAQs:\n${formattedFAQ}\n\nUser's Question: ${question}\nAnswer:\n`;
 
   const estimatedPromptTokens = estimateTokenCount(prompt);
   const estimatedOutputTokens = 100;
@@ -202,19 +193,11 @@ Answer:
       model: "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
     });
-
     const reply = completion.choices[0].message.content;
     const replyTokens = estimateTokenCount(reply);
     const updatedTokens = tokensUsed + estimatedPromptTokens + replyTokens;
-
     await usageRef.update({ tokensUsed: updatedTokens });
-
-    res.json({
-      reply,
-      tokensUsed: updatedTokens,
-      dailyLimit: DAILY_LIMIT,
-      tier: tier || "free",
-    });
+    res.json({ reply, tokensUsed: updatedTokens, dailyLimit: DAILY_LIMIT, tier: tier || "free" });
   } catch (err) {
     const errorResponse = err.response?.data || err.message || err;
     console.error("❌ DeepSeek API Error:", JSON.stringify(errorResponse, null, 2));
