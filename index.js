@@ -133,25 +133,50 @@ app.post("/api/upgrade-tier", async (req, res) => {
 // Chat Endpoint
 app.post("/api/chat", async (req, res) => {
   console.log("📩 /api/chat route hit!");
-  const { question, faqs } = req.body;
+
+  const { question } = req.body;
   const userId = req.headers["x-user-id"] || "test-user";
 
-  if (!question || !faqs || !Array.isArray(faqs)) {
-    return res.status(400).json({ error: "Missing question or FAQs." });
+  if (!question) {
+    return res.status(400).json({ error: "Missing question." });
   }
 
   let DAILY_LIMIT = 2000;
   let tier = "free";
 
+  // Fetch user's tier (free, pro, unlimited)
   try {
     const userDoc = await db.collection("users").doc(userId).get();
     if (userDoc.exists) tier = userDoc.data().tier || "free";
     if (tier === "pro") DAILY_LIMIT = 5000;
     else if (tier === "unlimited") DAILY_LIMIT = 999999;
-  } catch (e) {
-    console.warn("⚠️ Tier fetch failed:", e.message);
+  } catch (err) {
+    console.warn("⚠️ Tier fetch failed:", err.message);
   }
 
+  // Fetch user's FAQs from subcollection /faqs/{userId}/list
+  let faqs = [];
+  try {
+    const faqSnapshot = await db.collection("faqs").doc(userId).collection("list").get();
+    faqs = faqSnapshot.docs.map(doc => doc.data());
+  } catch (err) {
+    console.error("❌ Failed to fetch FAQs for user:", userId, err.message);
+  }
+
+  // Prepare the prompt
+  let prompt;
+  if (faqs.length > 0) {
+    const formattedFAQ = faqs.map((item, index) => `${index + 1}. Q: ${item.q} A: ${item.a}`).join("\n");
+    prompt = `You are an AI customer support assistant. Use the following FAQs to answer the user's question.\n\nFAQs:\n${formattedFAQ}\n\nUser's Question: ${question}\nAnswer:\n`;
+  } else {
+    prompt = `You are an AI customer support assistant. Answer the following question without any FAQs.\n\nUser's Question: ${question}\nAnswer:\n`;
+  }
+
+  const estimatedPromptTokens = estimateTokenCount(prompt);
+  const estimatedOutputTokens = 100;
+  const totalEstimated = estimatedPromptTokens + estimatedOutputTokens;
+
+  // Usage tracking
   const today = new Date().toDateString();
   const usageRef = db.collection("usage").doc(userId);
   let tokensUsed = 0;
@@ -176,18 +201,12 @@ app.post("/api/chat", async (req, res) => {
     return res.status(500).json({ error: "Failed to fetch usage data." });
   }
 
-  const formattedFAQ = faqs.map((item, index) => `${index + 1}. Q: ${item.q} A: ${item.a}`).join("\n");
-  const prompt = `You are an AI customer support assistant. Use the following FAQs to answer the user's question.\n\nFAQs:\n${formattedFAQ}\n\nUser's Question: ${question}\nAnswer:\n`;
-
-  const estimatedPromptTokens = estimateTokenCount(prompt);
-  const estimatedOutputTokens = 100;
-  const totalEstimated = estimatedPromptTokens + estimatedOutputTokens;
-
   if (tokensUsed + totalEstimated > DAILY_LIMIT) {
     await db.collection("users").doc(userId).update({ tier: "free" });
     return res.status(403).json({ error: "❌ Token limit exceeded. You are downgraded to Free Plan. Upgrade to continue." });
   }
 
+  // Generate AI response
   try {
     const completion = await openai.chat.completions.create({
       model: "deepseek-chat",
