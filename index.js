@@ -198,7 +198,7 @@ app.post("/api/chat", async (req, res) => {
     }
   } catch (err) {
     console.error("🔥 Usage fetch error:", err.message);
-    return res.status(500).json({ error: "Failed to fetch usage data." });
+    return res.status(500).json({ error: "❌ Failed to fetch usage data." });
   }
 
   if (tokensUsed + totalEstimated > DAILY_LIMIT) {
