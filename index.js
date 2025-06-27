@@ -130,11 +130,11 @@ app.post("/api/upgrade-tier", async (req, res) => {
   }
 });
 
-// Chat Endpoint
+// Chat Endpoint (Streaming Enabled)
 app.post("/api/chat", async (req, res) => {
   console.log("📩 /api/chat route hit!");
 
-  res.setTimeout(10000, () => {
+  res.setTimeout(15000, () => {
     return res.status(504).json({ error: "⏳ AI response timeout. Please try again." });
   });
 
@@ -148,12 +148,10 @@ app.post("/api/chat", async (req, res) => {
   let tier = "free";
   let DAILY_LIMIT = 2000;
 
-  // Firestore references
   const userRef = db.collection("users").doc(userId);
   const faqRef = db.collection("faqs").doc(userId).collection("list");
   const usageRef = db.collection("usage").doc(userId);
 
-  // Fetch in parallel
   let userDoc, faqSnapshot, usageSnap;
   try {
     [userDoc, faqSnapshot, usageSnap] = await Promise.all([
@@ -173,19 +171,17 @@ app.post("/api/chat", async (req, res) => {
     else if (tier === "unlimited") DAILY_LIMIT = 999999;
   }
 
-  // Format all FAQs
   const faqs = faqSnapshot.docs.map(doc => doc.data());
   const formattedFAQ = faqs.map((item, index) => `${index + 1}. Q: ${item.q} A: ${item.a}`).join("\n");
 
   const prompt = faqs.length
     ? `You are an AI customer support assistant. Use the following FAQs to answer the user's question.\n\nFAQs:\n${formattedFAQ}\n\nUser's Question: ${question}\nAnswer:\n`
-    : `You are an AI customer support assistant. Answer the following question without any FAQs.\n\nUser's Question: ${question}\nAnswer:\n`;
+    : `You are an AI customer support assistant. Answer the following question:\n\nUser's Question: ${question}\nAnswer:\n`;
 
   const estimatedPromptTokens = estimateTokenCount(prompt);
   const estimatedOutputTokens = 100;
   const totalEstimated = estimatedPromptTokens + estimatedOutputTokens;
 
-  // Usage tracking
   let tokensUsed = 0;
   try {
     const usageData = usageSnap.exists ? usageSnap.data() : null;
@@ -210,7 +206,11 @@ app.post("/api/chat", async (req, res) => {
     });
   }
 
-  // Generate AI response
+  // Set streaming headers
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Transfer-Encoding", "chunked");
+  res.setHeader("Cache-Control", "no-cache");
+
   try {
     const completion = await openai.chat.completions.create({
       model: "deepseek-chat",
@@ -218,28 +218,24 @@ app.post("/api/chat", async (req, res) => {
       stream: true,
     });
 
-    const choices = completion?.choices;
-    if (!choices || !choices[0]?.message?.content) {
-      console.error("❌ No valid response from DeepSeek API:", completion);
-      return res.status(500).json({ error: "No valid response from model." });
+    let replyText = "";
+    for await (const chunk of completion) {
+      const delta = chunk?.choices?.[0]?.delta?.content || "";
+      if (delta) {
+        replyText += delta;
+        res.write(delta);
+      }
     }
-    const reply = choices[0].message.content;
 
-    const replyTokens = estimateTokenCount(reply);
+    const replyTokens = estimateTokenCount(replyText);
     const updatedTokens = tokensUsed + estimatedPromptTokens + replyTokens;
-
     await usageRef.update({ tokensUsed: updatedTokens });
 
-    res.json({
-      reply,
-      tokensUsed: updatedTokens,
-      dailyLimit: DAILY_LIMIT,
-      tier: tier || "free",
-    });
+    res.end();
   } catch (err) {
-    const errorResponse = err.response?.data || err.message || err;
-    console.error("❌ DeepSeek API Error:", JSON.stringify(errorResponse, null, 2));
-    res.status(500).json({ error: "Failed to generate response.", debug: errorResponse });
+    const debug = err?.response?.data || err?.message || err;
+    console.error("❌ DeepSeek API Error:", JSON.stringify(debug, null, 2));
+    res.status(500).json({ error: "Failed to stream response.", debug });
   }
 });
 
