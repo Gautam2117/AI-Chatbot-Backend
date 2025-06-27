@@ -218,7 +218,13 @@ app.post("/api/chat", async (req, res) => {
       stream: true,
     });
 
-    const reply = completion.choices[0].message.content;
+    const choices = completion?.choices;
+    if (!choices || !choices[0]?.message?.content) {
+      console.error("❌ No valid response from DeepSeek API:", completion);
+      return res.status(500).json({ error: "No valid response from model." });
+    }
+    const reply = choices[0].message.content;
+
     const replyTokens = estimateTokenCount(reply);
     const updatedTokens = tokensUsed + estimatedPromptTokens + replyTokens;
 
