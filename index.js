@@ -134,6 +134,10 @@ app.post("/api/upgrade-tier", async (req, res) => {
 app.post("/api/chat", async (req, res) => {
   console.log("📩 /api/chat route hit!");
 
+  res.setTimeout(10000, () => {
+    return res.status(504).json({ error: "⏳ AI response timeout. Please try again." });
+  });
+
   const { question } = req.body;
   const userId = req.headers["x-user-id"] || "test-user";
 
@@ -141,69 +145,69 @@ app.post("/api/chat", async (req, res) => {
     return res.status(400).json({ error: "Missing question." });
   }
 
-  let DAILY_LIMIT = 2000;
   let tier = "free";
+  let DAILY_LIMIT = 2000;
 
-  // Fetch user's tier (free, pro, unlimited)
+  // Firestore references
+  const userRef = db.collection("users").doc(userId);
+  const faqRef = db.collection("faqs").doc(userId).collection("list");
+  const usageRef = db.collection("usage").doc(userId);
+
+  // Fetch in parallel
+  let userDoc, faqSnapshot, usageSnap;
   try {
-    const userDoc = await db.collection("users").doc(userId).get();
-    if (userDoc.exists) tier = userDoc.data().tier || "free";
+    [userDoc, faqSnapshot, usageSnap] = await Promise.all([
+      userRef.get(),
+      faqRef.get(),
+      usageRef.get(),
+    ]);
+  } catch (err) {
+    console.error("❌ Firestore fetch error:", err.message);
+    return res.status(500).json({ error: "Failed to fetch Firestore data." });
+  }
+
+  // Determine tier
+  if (userDoc.exists) {
+    tier = userDoc.data().tier || "free";
     if (tier === "pro") DAILY_LIMIT = 5000;
     else if (tier === "unlimited") DAILY_LIMIT = 999999;
-  } catch (err) {
-    console.warn("⚠️ Tier fetch failed:", err.message);
   }
 
-  // Fetch user's FAQs from subcollection /faqs/{userId}/list
-  let faqs = [];
-  try {
-    const faqSnapshot = await db.collection("faqs").doc(userId).collection("list").get();
-    faqs = faqSnapshot.docs.map(doc => doc.data());
-  } catch (err) {
-    console.error("❌ Failed to fetch FAQs for user:", userId, err.message);
-  }
+  // Format all FAQs
+  const faqs = faqSnapshot.docs.map(doc => doc.data());
+  const formattedFAQ = faqs.map((item, index) => `${index + 1}. Q: ${item.q} A: ${item.a}`).join("\n");
 
-  // Prepare the prompt
-  let prompt;
-  if (faqs.length > 0) {
-    const formattedFAQ = faqs.map((item, index) => `${index + 1}. Q: ${item.q} A: ${item.a}`).join("\n");
-    prompt = `You are an AI customer support assistant. Use the following FAQs to answer the user's question.\n\nFAQs:\n${formattedFAQ}\n\nUser's Question: ${question}\nAnswer:\n`;
-  } else {
-    prompt = `You are an AI customer support assistant. Answer the following question without any FAQs.\n\nUser's Question: ${question}\nAnswer:\n`;
-  }
+  const prompt = faqs.length
+    ? `You are an AI customer support assistant. Use the following FAQs to answer the user's question.\n\nFAQs:\n${formattedFAQ}\n\nUser's Question: ${question}\nAnswer:\n`
+    : `You are an AI customer support assistant. Answer the following question without any FAQs.\n\nUser's Question: ${question}\nAnswer:\n`;
 
   const estimatedPromptTokens = estimateTokenCount(prompt);
   const estimatedOutputTokens = 100;
   const totalEstimated = estimatedPromptTokens + estimatedOutputTokens;
 
   // Usage tracking
-  const today = new Date().toDateString();
-  const usageRef = db.collection("usage").doc(userId);
   let tokensUsed = 0;
-
   try {
-    const usageSnap = await usageRef.get();
-    let usageData = null;
-    let resetToday = true;
-    if (usageSnap.exists) {
-      usageData = usageSnap.data();
-      const lastReset = usageData.lastReset?.toDate().toDateString?.();
-      resetToday = lastReset !== today;
-    }
-    if (resetToday) {
+    const usageData = usageSnap.exists ? usageSnap.data() : null;
+    const lastReset = usageData?.lastReset?.toDate().toDateString?.();
+    const today = new Date().toDateString();
+
+    if (!usageSnap.exists || lastReset !== today) {
       await usageRef.set({ tokensUsed: 0, lastReset: Timestamp.now() });
       tokensUsed = 0;
     } else {
-      tokensUsed = usageData?.tokensUsed || 0;
+      tokensUsed = usageData.tokensUsed || 0;
     }
   } catch (err) {
-    console.error("🔥 Usage fetch error:", err.message);
-    return res.status(500).json({ error: "❌ Failed to fetch usage data." });
+    console.error("🔥 Usage tracking error:", err.message);
+    return res.status(500).json({ error: "Failed to track token usage." });
   }
 
   if (tokensUsed + totalEstimated > DAILY_LIMIT) {
-    await db.collection("users").doc(userId).update({ tier: "free" });
-    return res.status(403).json({ error: "❌ Token limit exceeded. You are downgraded to Free Plan. Upgrade to continue." });
+    await userRef.update({ tier: "free" });
+    return res.status(403).json({
+      error: "❌ Token limit exceeded. You are downgraded to Free Plan. Upgrade to continue.",
+    });
   }
 
   // Generate AI response
@@ -211,12 +215,21 @@ app.post("/api/chat", async (req, res) => {
     const completion = await openai.chat.completions.create({
       model: "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
+      stream: true,
     });
+
     const reply = completion.choices[0].message.content;
     const replyTokens = estimateTokenCount(reply);
     const updatedTokens = tokensUsed + estimatedPromptTokens + replyTokens;
+
     await usageRef.update({ tokensUsed: updatedTokens });
-    res.json({ reply, tokensUsed: updatedTokens, dailyLimit: DAILY_LIMIT, tier: tier || "free" });
+
+    res.json({
+      reply,
+      tokensUsed: updatedTokens,
+      dailyLimit: DAILY_LIMIT,
+      tier: tier || "free",
+    });
   } catch (err) {
     const errorResponse = err.response?.data || err.message || err;
     console.error("❌ DeepSeek API Error:", JSON.stringify(errorResponse, null, 2));
