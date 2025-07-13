@@ -17,6 +17,7 @@
     "ioredis": "^5.6.1",
     "node-cron": "^4.2.1",
     "openai": "^4.98.0",
-    "razorpay": "^2.9.6"
+    "razorpay": "^2.9.6",
+    "string-similarity": "^4.0.4"
   }
 }
