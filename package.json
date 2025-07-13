@@ -2,13 +2,14 @@
   "name": "server",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "author": "Gautam Govind",
+  "license": "MIT",
+  "description": "AI Chatbot backend with Express, Firestore, Razorpay, and Deepseek",
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
