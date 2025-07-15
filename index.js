@@ -14,24 +14,12 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const allowedOrigins = [
-  "http://localhost:5173",
-  "https://ai-chatbot-saas-eight.vercel.app",
-];
-
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
-    },
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type", "x-user-id"],
-  })
-);
+app.use(cors({
+  origin: true, // Reflects the request origin in the response
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "x-user-id"],
+  credentials: true // If you want cookies or tokens passed with requests
+}));
 
 app.use(express.json());
 
