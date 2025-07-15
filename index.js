@@ -261,6 +261,12 @@ app.post("/api/chat", async (req, res) => {
     tokensUsedToday = 0;
   }
 
+  if (tokensUsedToday >= dailyLimit) {
+    return res.status(403).json({
+      error: "❌ Company token limit exceeded. Please upgrade to continue.",
+    });
+  }
+
   // 📋 Load and sanitize FAQs
   let faqs = [];
   try {
@@ -426,5 +432,36 @@ app.post("/api/register-company", async (req, res) => {
     res.status(500).json({ error: "Failed to register company." });
   }
 });
+
+app.get("/api/usage-status", async (req, res) => {
+  const userId = req.headers["x-user-id"];
+  if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+  const userSnap = await db.collection("users").doc(userId).get();
+  const userData = userSnap.data();
+  const companyId = userData?.companyId;
+
+  const companySnap = await db.collection("companies").doc(companyId).get();
+  const companyData = companySnap.data();
+
+  const { tier = "free", tokensUsedToday = 0, lastReset } = companyData || {};
+  const tierLimits = { free: 1000, pro: 5000, unlimited: Infinity };
+  const dailyLimit = tierLimits[tier] ?? 1000;
+
+  const today = new Date().toDateString();
+  const lastResetDate = lastReset?.toDate?.()?.toDateString?.();
+
+  if (!lastReset || lastResetDate !== today) {
+    await db.collection("companies").doc(companyId).update({
+      tokensUsedToday: 0,
+      lastReset: Timestamp.now(),
+    });
+    return res.json({ usage: 0, limit: dailyLimit, blocked: false });
+  }
+
+  const blocked = tokensUsedToday >= dailyLimit;
+  return res.json({ usage: tokensUsedToday, limit: dailyLimit, blocked });
+});
+
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
