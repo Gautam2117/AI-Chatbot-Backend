@@ -21,7 +21,6 @@ app.use(cors({
   credentials: true // If you want cookies or tokens passed with requests
 }));
 
-app.use("/api/razorpay-webhook", express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 // Razorpay Setup
@@ -409,19 +408,26 @@ app.post("/api/chat", async (req, res) => {
     res.write("\n[Error: generation failed]");
   } finally {
     try {
-      const replyTokens = estimateTokenCount(replyText);
-      const tokensToAdd = estimatedPromptTokens + replyTokens;
+      await db.runTransaction(async (transaction) => {
+        const docSnap = await transaction.get(companyRef);
+        const company = docSnap.data();
+        const lastResetDate = company?.lastReset?.toDate()?.toDateString?.();
+        const today = new Date().toDateString();
 
-      if (!lastReset || lastResetDate !== today) {
-        await companyRef.update({
-          tokensUsedToday: tokensToAdd,
-          lastReset: Timestamp.now(),
-        });
-      } else {
-        await companyRef.update({
-          tokensUsedToday: FieldValue.increment(tokensToAdd),
-        });
-      }
+        const replyTokens = estimateTokenCount(replyText);
+        const totalTokensToAdd = estimatedPromptTokens + replyTokens;
+
+        if (!lastResetDate || lastResetDate !== today) {
+          transaction.update(companyRef, {
+            tokensUsedToday: totalTokensToAdd,
+            lastReset: Timestamp.now(),
+          });
+        } else {
+          transaction.update(companyRef, {
+            tokensUsedToday: FieldValue.increment(totalTokensToAdd),
+          });
+        }
+      });
     } catch (e) {
       console.warn("⚠️ Token update failed:", e.message);
     }
@@ -518,7 +524,9 @@ app.get("/api/usage-status", async (req, res) => {
   const today = new Date().toDateString();
   const lastResetDate = lastReset?.toDate?.()?.toDateString?.();
 
+  // Better: Move this logic out of the API route if it's already handled by dailyReset.js
   if (!lastReset || lastResetDate !== today) {
+    console.log("⚠️ Resetting tokens due to date mismatch:", lastResetDate, today);
     await companyRef.update({
       tokensUsedToday: 0,
       lastReset: Timestamp.now(),
@@ -527,7 +535,7 @@ app.get("/api/usage-status", async (req, res) => {
       usage: 0,
       limit: dailyLimit,
       blocked: false,
-      subscriptionExpiresAt: tier === "free" ? null : subscriptionExpiresAtRaw, // include only if active
+      subscriptionExpiresAt: tier === "free" ? null : subscriptionExpiresAtRaw,
     });
   }
 
