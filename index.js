@@ -21,6 +21,7 @@ app.use(cors({
   credentials: true // If you want cookies or tokens passed with requests
 }));
 
+app.use("/api/razorpay-webhook", express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 // Razorpay Setup
@@ -90,16 +91,29 @@ app.post("/api/create-order", async (req, res) => {
   }
 });
 
-// Razorpay Webhook (Updated Signature Handling)
+// Razorpay Webhook (Fixed Signature & Payload Handling)
 app.post("/api/razorpay-webhook", express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-razorpay-signature'];
   const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
 
+  if (!signature || !secret) {
+    console.warn("❌ Missing Razorpay signature or secret");
+    return res.status(400).send("Missing signature or secret");
+  }
+
+  let rawBody;
+  try {
+    rawBody = req.body.toString("utf8"); // Convert buffer to string
+  } catch (err) {
+    console.error("❌ Failed to parse raw body:", err.message);
+    return res.status(400).send("Invalid raw body");
+  }
+
   // Signature validation
   const generatedSignature = crypto
-    .createHmac('sha256', secret)
-    .update(req.body)
-    .digest('hex');
+    .createHmac("sha256", secret)
+    .update(rawBody)
+    .digest("hex");
 
   if (generatedSignature !== signature) {
     console.warn("❌ Invalid Razorpay webhook signature");
@@ -108,13 +122,13 @@ app.post("/api/razorpay-webhook", express.raw({ type: 'application/json' }), asy
 
   let event;
   try {
-    event = JSON.parse(req.body);
+    event = JSON.parse(rawBody);
   } catch (err) {
     console.error("❌ JSON parse error:", err.message);
     return res.status(400).send("Invalid JSON payload");
   }
 
-  const eventId = event?.event || event?.payload?.payment?.entity?.id;
+  const eventId = event?.payload?.payment?.entity?.id || event?.event;
   if (!eventId) return res.status(400).send("❌ Invalid webhook: missing event ID");
 
   // 🧠 Deduplication
@@ -125,9 +139,9 @@ app.post("/api/razorpay-webhook", express.raw({ type: 'application/json' }), asy
     return res.status(200).send("✅ Webhook already processed");
   }
 
-  console.log(`📢 Razorpay Webhook: ${event.event}`);
+  console.log(`📢 Razorpay Webhook Received: ${event.event}`);
 
-  // Handle upgrade on payment capture
+  // ✅ Handle subscription upgrade on payment capture
   if (event.event === "payment.captured") {
     const payment = event.payload.payment.entity;
     const notes = payment.notes || {};
@@ -150,25 +164,29 @@ app.post("/api/razorpay-webhook", express.raw({ type: 'application/json' }), asy
           tier: plan,
           tokensUsedToday: 0,
           lastReset: now,
-           subscriptionExpiresAt: Timestamp.fromDate(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)),
+          subscriptionExpiresAt: Timestamp.fromDate(
+            new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
+          ),
         }, { merge: true });
 
-        console.log(`✅ Upgraded company ${companyId} to ${plan}`);
+        console.log(`✅ Upgraded company ${companyId} to '${plan}'`);
       } catch (err) {
         console.error("🔥 Firestore upgrade error:", err.message);
       }
+    } else {
+      console.warn("⚠️ Missing userId or plan in payment notes");
     }
   }
 
-  // Optional: log other events for debugging
+  // 📦 Optional: log other events
   else if (event.event === "payment.failed") {
-    console.warn("⚠️ Payment failed:", event.payload.payment.entity.id);
+    console.warn("⚠️ Payment failed:", event.payload?.payment?.entity?.id);
   } else if (event.event === "order.paid") {
-    console.log("💸 Order paid:", event.payload.order.entity.id);
+    console.log("💸 Order paid:", event.payload?.order?.entity?.id);
   } else if (event.event === "refund.processed") {
-    console.log("💸 Refund processed:", event.payload.refund.entity.id);
+    console.log("💸 Refund processed:", event.payload?.refund?.entity?.id);
   } else if (event.event === "invoice.paid") {
-    console.log("🧾 Invoice paid:", event.payload.invoice.entity.id);
+    console.log("🧾 Invoice paid:", event.payload?.invoice?.entity?.id);
   }
 
   // ✅ Log for audit trail
