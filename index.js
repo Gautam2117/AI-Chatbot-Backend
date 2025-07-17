@@ -150,6 +150,7 @@ app.post("/api/razorpay-webhook", express.raw({ type: 'application/json' }), asy
           tier: plan,
           tokensUsedToday: 0,
           lastReset: now,
+           subscriptionExpiresAt: Timestamp.fromDate(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)),
         }, { merge: true });
 
         console.log(`✅ Upgraded company ${companyId} to ${plan}`);
@@ -182,6 +183,11 @@ app.post("/api/razorpay-webhook", express.raw({ type: 'application/json' }), asy
 
 // 🔥 Old: Upgrade Tier via Frontend (Optional for Testing)
 app.post("/api/upgrade-tier", async (req, res) => {
+
+  if (process.env.NODE_ENV === "production") {
+    return res.status(403).json({ error: "Manual upgrade disabled in production." });
+  }
+
   const { userId, plan } = req.body;
   if (!userId || !plan) {
     return res.status(400).json({ error: "Missing userId or plan" });
@@ -190,19 +196,21 @@ app.post("/api/upgrade-tier", async (req, res) => {
   try {
     const userSnap = await db.collection("users").doc(userId).get();
     const userData = userSnap.data();
+    const companyId = userData?.companyId;
 
-    if (!userData?.companyId) {
+    if (!companyId) {
       return res.status(400).json({ error: "User has no company linked" });
     }
 
-    await db.collection("companies").doc(userData.companyId).set(
-      {
-        tier: plan,
-        tokensUsedToday: 0,
-        lastReset: Timestamp.now(),
-      },
-      { merge: true }
-    );
+    const now = Timestamp.now();
+    const oneMonthLater = Timestamp.fromDate(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)); // 30 days
+
+    await db.collection("companies").doc(companyId).set({
+      tier: plan,
+      tokensUsedToday: 0,
+      lastReset: now,
+      subscriptionExpiresAt: oneMonthLater,
+    }, { merge: true });
 
     res.json({ success: true, message: `Tier upgraded to ${plan}` });
   } catch (err) {
@@ -245,8 +253,26 @@ app.post("/api/chat", async (req, res) => {
   const companyDoc = await companyRef.get();
   if (!companyDoc.exists) return res.status(404).json({ error: "Company not found." });
 
+  const companyData = companyDoc.data();
+  const subscriptionExpiresAt = companyData?.subscriptionExpiresAt?.toDate?.();
+
+  // 🛠️ Downgrade if expired + update local companyData
+  if (subscriptionExpiresAt && subscriptionExpiresAt < new Date()) {
+    await companyRef.update({
+      tier: "free",
+      subscriptionExpiresAt: null,
+    });
+
+    // ✅ ALSO update your local object so that `tier` is correct
+    companyData.tier = "free";
+  }
+
   // 📊 Tier & token limits
-  let { tier = "free", tokensUsedToday = 0, lastReset } = companyDoc.data();
+  let {
+    tier = "free",
+    tokensUsedToday = 0,
+    lastReset,
+  } = companyData;
   const tierLimits = { free: 1000, pro: 5000, unlimited: Infinity };
   const dailyLimit = tierLimits[tier] ?? 1000;
 
@@ -437,31 +463,64 @@ app.get("/api/usage-status", async (req, res) => {
   const userId = req.headers["x-user-id"];
   if (!userId) return res.status(400).json({ error: "Missing userId" });
 
+  // 🔐 Fetch user and company
   const userSnap = await db.collection("users").doc(userId).get();
   const userData = userSnap.data();
   const companyId = userData?.companyId;
 
-  const companySnap = await db.collection("companies").doc(companyId).get();
+  if (!companyId) {
+    return res.status(404).json({ error: "User has no company linked" });
+  }
+
+  const companyRef = db.collection("companies").doc(companyId);
+  const companySnap = await companyRef.get();
   const companyData = companySnap.data();
 
-  const { tier = "free", tokensUsedToday = 0, lastReset } = companyData || {};
+  if (!companyData) {
+    return res.status(404).json({ error: "Company not found" });
+  }
+
+  // ⏳ Subscription expiry logic
+  const subscriptionExpiresAtRaw = companyData?.subscriptionExpiresAt;
+  const subscriptionExpiresAt = subscriptionExpiresAtRaw?.toDate?.();
+  let { tier = "free", tokensUsedToday = 0, lastReset } = companyData;
+
+  if (subscriptionExpiresAt && subscriptionExpiresAt < new Date()) {
+    await companyRef.update({
+      tier: "free",
+      subscriptionExpiresAt: null,
+    });
+    tier = "free";
+  }
+
   const tierLimits = { free: 1000, pro: 5000, unlimited: Infinity };
   const dailyLimit = tierLimits[tier] ?? 1000;
 
+  // 🔄 Reset if new day
   const today = new Date().toDateString();
   const lastResetDate = lastReset?.toDate?.()?.toDateString?.();
 
   if (!lastReset || lastResetDate !== today) {
-    await db.collection("companies").doc(companyId).update({
+    await companyRef.update({
       tokensUsedToday: 0,
       lastReset: Timestamp.now(),
     });
-    return res.json({ usage: 0, limit: dailyLimit, blocked: false });
+    return res.json({
+      usage: 0,
+      limit: dailyLimit,
+      blocked: false,
+      subscriptionExpiresAt: tier === "free" ? null : subscriptionExpiresAtRaw, // include only if active
+    });
   }
 
   const blocked = tokensUsedToday >= dailyLimit;
-  return res.json({ usage: tokensUsedToday, limit: dailyLimit, blocked });
-});
 
+  return res.json({
+    usage: tokensUsedToday,
+    limit: dailyLimit,
+    blocked,
+    subscriptionExpiresAt: tier === "free" ? null : subscriptionExpiresAtRaw,
+  });
+});
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
