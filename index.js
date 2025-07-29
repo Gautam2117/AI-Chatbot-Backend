@@ -46,8 +46,8 @@ app.get("/", (req, res) => {
 
 // Razorpay: Create Order
 const PLAN_PRICING = {
-  pro: 9900,        // ₹99.00 in paise
-  unlimited: 24900  // ₹249.00 in paise
+  pro: 14900,
+  pro_max: 39900,
 };
 
 app.post("/api/create-order", async (req, res) => {
@@ -290,7 +290,11 @@ app.post("/api/chat", async (req, res) => {
     tokensUsedToday = 0,
     lastReset,
   } = companyData;
-  const tierLimits = { free: 1000, pro: 5000, unlimited: Infinity };
+  const tierLimits = { free: 1000, pro: 10000, pro_max: 66000 };
+  const monthlyCaps = { free: 30000, pro: 300000, pro_max: 2000000 };
+  const monthlyCap = monthlyCaps[tier] ?? 30000;
+  const tokensUsedMonth = companyData?.tokensUsedMonth || 0;
+
   const dailyLimit = tierLimits[tier] ?? 1000;
 
   const today = new Date().toDateString();
@@ -383,6 +387,12 @@ app.post("/api/chat", async (req, res) => {
     });
   }
 
+  if (tokensUsedMonth + totalEstimated > monthlyCap) {
+    return res.status(403).json({
+      error: "❌ Monthly token cap reached. Please wait for renewal or upgrade.",
+    });
+  }
+
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Transfer-Encoding", "chunked");
   res.setHeader("Cache-Control", "no-cache");
@@ -420,11 +430,13 @@ app.post("/api/chat", async (req, res) => {
         if (!lastResetDate || lastResetDate !== today) {
           transaction.update(companyRef, {
             tokensUsedToday: totalTokensToAdd,
+            tokensUsedMonth: FieldValue.increment(totalTokensToAdd),
             lastReset: Timestamp.now(),
           });
         } else {
           transaction.update(companyRef, {
             tokensUsedToday: FieldValue.increment(totalTokensToAdd),
+            tokensUsedMonth: FieldValue.increment(totalTokensToAdd),
           });
         }
       });
@@ -517,7 +529,7 @@ app.get("/api/usage-status", async (req, res) => {
     tier = "free";
   }
 
-  const tierLimits = { free: 1000, pro: 5000, unlimited: Infinity };
+  const tierLimits = { free: 1000, pro: 10000, pro_max: 66000 };
   const dailyLimit = tierLimits[tier] ?? 1000;
 
   // 🔄 Reset if new day
