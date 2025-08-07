@@ -451,10 +451,14 @@ app.post("/api/billing/subscribe", async (req, res) => {
       }
     }
 
+    const MAX_YEARS = 100;
+    const cycles =
+      planKey.includes('yearly') ? MAX_YEARS : MAX_YEARS * 12;
+
     // NOTE: total_count — if omitted/0, Razorpay treats it as "auto-renew till cancelled".
     const sub = await razorpay.subscriptions.create({
       plan_id: planId,
-      /* omit total_count to get “auto-renew until cancelled” */
+      total_count: cycles,
       customer_notify: 1,
       customer_id: customerId || undefined,
       notes: { planKey, companyId: targetCompanyId, userId: userId || "" },
