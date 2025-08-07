@@ -157,7 +157,8 @@ async function nightlyOverageJob() {
     if (blocks === 0 || c.isOverageBilled) continue;
 
     try {
-      await razorpay.subscriptions.addAddon(c.subscriptionId, {
+      await razorpay.addons.create({
+        subscription_id: c.subscriptionId,
         item: {
           name: `Overage ${blocks * 1000} messages`,
           amount: PLAN_CATALOG.overage_1k.amountPaise * blocks,
@@ -520,7 +521,8 @@ app.post("/api/billing/buy-overage", async (req, res) => {
     const subId     = snap.data()?.subscriptionId;
     if (!subId) return res.status(400).json({ error: "No active subscription" });
 
-    const addon = await razorpay.subscriptions.addAddon(subId, {
+    const addon = await razorpay.addons.create({
+      subscription_id: subId,
       item: {
         name: `Pre-paid ${blocks * 1000} messages`,
         amount: PLAN_CATALOG.overage_1k.amountPaise * blocks,
