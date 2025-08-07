@@ -454,11 +454,10 @@ app.post("/api/billing/subscribe", async (req, res) => {
     // NOTE: total_count — if omitted/0, Razorpay treats it as "auto-renew till cancelled".
     const sub = await razorpay.subscriptions.create({
       plan_id: planId,
-      total_count: 0, // continue indefinitely
+      /* omit total_count to get “auto-renew until cancelled” */
       customer_notify: 1,
       customer_id: customerId || undefined,
       notes: { planKey, companyId: targetCompanyId, userId: userId || "" },
-      // charge_at: undefined // immediate
     });
 
     // Store subscription shell immediately
@@ -490,9 +489,16 @@ app.post("/api/billing/subscribe", async (req, res) => {
       },
     });
   } catch (e) {
-    console.error("subscribe error", e);
-    res.status(500).json({ error: e.message || "Failed to create subscription" });
-  }
+    console.error("subscribe error", e);          // still in logs
+
+    /* Bubble a safe message back so the FE can show it */
+    const msg =
+      e?.error?.description        // Razorpay REST errors
+    || e?.message                  // ordinary JS Error
+    || "Unknown subscribe error";
+
+    res.status(500).json({ error: msg });
+    }
 });
 
 /* ===========================================================
