@@ -3,30 +3,50 @@ import cron from "node-cron";
 import { db } from "./firebase.js";
 import { Timestamp } from "firebase-admin/firestore";
 
-console.log("📆 Scheduling daily reset job...");
+console.log("📆 Scheduling daily reset job (00:00 IST)…");
 
-cron.schedule("30 18 * * *", async () => {
-  try {
-    const now = new Date();
-    const isFirstOfMonth = now.getDate() === 1;
+/*
+ * Runs every day at 18:30 UTC = 00:00 IST
+ * • Clears legacy token counters (optional)
+ * • Clears messagesUsedMonth for FREE workspaces on the 1st
+ * • Resets isOverageBilled at start of every month
+ */
+cron.schedule(
+  "0 0 * * *", // ⏰ adjust if your host isn’t UTC
+  async () => {
+    try {
+      const now = new Date();
+      const firstOfMonth = now.getDate() === 1;
 
-    const snapshot = await db.collection("companies").get();
+      const snap = await db.collection("companies").get();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        const updates = {
+          // legacy – harmless to keep
+          messagesUsedToday: 0,
+          tokensUsedToday: 0,
+          tokensUsedMonth: firstOfMonth ? 0 : FieldValue.delete?.() ?? 0,
+          lastReset: Timestamp.now(),
+        };
 
-    for (const doc of snapshot.docs) {
-      const updates = {
-        tokensUsedToday: 0,
-        lastReset: Timestamp.now(),
-      };
+        /* monthly work */
+        if (firstOfMonth) {
+          updates.isOverageBilled = false;      // allow next-cycle add-on
+          updates.messagesUsedMonth = 0;          // legacy
+          if ((data.tier || "free") === "free") {
+            updates.messagesUsedMonth = 0;      // reset free plan quota
+          }
+        }
 
-      if (isFirstOfMonth) {
-        updates.tokensUsedMonth = 0;
+        await doc.ref.update(updates);
       }
 
-      await doc.ref.update(updates);
+      console.log(
+        `✅ Daily reset done${firstOfMonth ? " (+monthly reset)" : ""}`
+      );
+    } catch (err) {
+      console.error("❌ Daily reset failed:", err.message);
     }
-
-    console.log(`✅ Daily reset${isFirstOfMonth ? " with monthly reset" : ""} completed`);
-  } catch (err) {
-    console.error("❌ Daily reset failed:", err.message);
-  }
-});
+  },
+  { timezone: "Asia/Kolkata" }          // ensure cron fires at local midnight
+);

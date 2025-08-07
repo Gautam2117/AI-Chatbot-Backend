@@ -1,6 +1,8 @@
-// server.js (complete)
+// server.js (autopay + yearly + message quotas)
 
 import "./dailyReset.js";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet"
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -10,247 +12,577 @@ import crypto from "crypto";
 import { Timestamp, FieldValue } from "firebase-admin/firestore";
 import { db } from "./firebase.js";
 import stringSimilarity from "string-similarity";
+import basicAuth from "express-basic-auth";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-
-// If you're behind a proxy (Render/Heroku/NGINX), so req.ip works properly
 app.set("trust proxy", 1);
 
-// --- CORS ---
+/* =========================
+   CORS
+========================= */
 app.use(
   cors({
-    origin: true, // Reflect the request origin
+    origin: true,
     methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type", "x-user-id"],
     credentials: true,
   })
 );
 
-/**
- * IMPORTANT: Razorpay webhook needs raw body for signature verification.
- * Register the webhook route BEFORE express.json().
- */
+app.use(helmet());
 
-// Razorpay Webhook (Fixed Signature & Payload Handling)
-app.post(
-  "/api/razorpay-webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const signature = req.headers["x-razorpay-signature"];
-    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+/* =========================
+   Razorpay client
+========================= */
+const keyId     = process.env.RAZORPAY_KEY_ID;
+const keySecret = process.env.RAZORPAY_SECRET;
 
-    if (!signature || !secret) {
-      console.warn("❌ Missing Razorpay signature or secret");
-      return res.status(400).send("Missing signature or secret");
-    }
+if (!keyId || !keySecret) {
+  throw new Error(
+    "Razorpay keys not found in environment. Refusing to start."
+  );
+}
 
-    let rawBody;
-    try {
-      rawBody = req.body.toString("utf8"); // Convert buffer to string
-    } catch (err) {
-      console.error("❌ Failed to parse raw body:", err.message);
-      return res.status(400).send("Invalid raw body");
-    }
+const razorpay = new Razorpay({ key_id: keyId, key_secret: keySecret });
 
-    // Signature validation
-    const generatedSignature = crypto
-      .createHmac("sha256", secret)
-      .update(rawBody)
-      .digest("hex");
+/* =========================
+   OpenAI / DeepSeek
+========================= */
+if (!process.env.DEEPSEEK_API_KEY) throw new Error("Missing DEEPSEEK_API_KEY");
+if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_SECRET)
+  throw new Error("Missing Razorpay keys");
 
-    if (generatedSignature !== signature) {
-      console.warn("❌ Invalid Razorpay webhook signature");
-      return res.status(400).send("Invalid signature");
-    }
-
-    let event;
-    try {
-      event = JSON.parse(rawBody);
-    } catch (err) {
-      console.error("❌ JSON parse error:", err.message);
-      return res.status(400).send("Invalid JSON payload");
-    }
-
-    const eventId = event?.payload?.payment?.entity?.id || event?.event;
-    if (!eventId) return res.status(400).send("❌ Invalid webhook: missing event ID");
-
-    // 🧠 Deduplication
-    const logRef = db.collection("webhookLogs").doc(eventId);
-    const existing = await logRef.get();
-    if (existing.exists) {
-      console.log(`ℹ️ Webhook ${eventId} already processed`);
-      return res.status(200).send("✅ Webhook already processed");
-    }
-
-    console.log(`📢 Razorpay Webhook Received: ${event.event}`);
-
-    // ✅ Handle subscription upgrade on payment capture
-    if (event.event === "payment.captured") {
-      const payment = event.payload.payment.entity;
-      const notes = payment.notes || {};
-      const userId = notes.userId;
-      const plan = notes.plan;
-
-      if (userId && plan) {
-        try {
-          const userSnap = await db.collection("users").doc(userId).get();
-          const userData = userSnap.data();
-
-          if (!userData?.companyId) {
-            throw new Error("Company ID not found for user");
-          }
-
-          const companyId = userData.companyId;
-          const now = Timestamp.now();
-
-          await db
-            .collection("companies")
-            .doc(companyId)
-            .set(
-              {
-                tier: plan,
-                tokensUsedToday: 0,
-                lastReset: now,
-                subscriptionExpiresAt: Timestamp.fromDate(
-                  new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
-                ),
-              },
-              { merge: true }
-            );
-
-          console.log(`✅ Upgraded company ${companyId} to '${plan}'`);
-        } catch (err) {
-          console.error("🔥 Firestore upgrade error:", err.message);
-        }
-      } else {
-        console.warn("⚠️ Missing userId or plan in payment notes");
-      }
-    } else if (event.event === "payment.failed") {
-      console.warn("⚠️ Payment failed:", event.payload?.payment?.entity?.id);
-    } else if (event.event === "order.paid") {
-      console.log("💸 Order paid:", event.payload?.order?.entity?.id);
-    } else if (event.event === "refund.processed") {
-      console.log("💸 Refund processed:", event.payload?.refund?.entity?.id);
-    } else if (event.event === "invoice.paid") {
-      console.log("🧾 Invoice paid:", event.payload?.invoice?.entity?.id);
-    }
-
-    // ✅ Log for audit trail
-    await logRef.set({
-      timestamp: Timestamp.now(),
-      type: event.event,
-      raw: event,
-    });
-
-    res.status(200).send("✅ Webhook processed");
-  }
-);
-
-// After webhook is wired, JSON parser is safe to use for the rest
-app.use(express.json({ limit: "1mb" }));
-
-// Razorpay Setup
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || "rzp_test_dummy",
-  key_secret: process.env.RAZORPAY_SECRET || "test_dummy_secret",
-});
-
-// DeepSeek Setup
 const openai = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseURL: "https://api.deepseek.com",
 });
 
-function estimateTokenCount(text) {
-  return Math.ceil(text.length / 4);
-}
-
-// Test Endpoint
-app.get("/", (req, res) => {
-  res.send("✅ AI Chatbot + Razorpay API running...");
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION:", err);
 });
 
-// Razorpay: Create Order
-const PLAN_PRICING = {
-  pro: 14900,
-  pro_max: 39900,
+/* =========================
+   Plans (INR, paise)
+   - You can pre-create plans in Razorpay and put IDs in .env
+   - If an ID is missing, server will create a plan on demand (and cache it in memory)
+========================= */
+const PLAN_CATALOG = {
+  // Pro — 3,000 msgs / month
+  pro_monthly: {
+    tier: "pro",
+    period: "monthly",
+    interval: 1,
+    amountPaise: 649900, // ₹6,499.00
+    name: "Botify Pro (3,000 msgs) — Monthly",
+    envKey: "RP_PLAN_PRO_MONTHLY",
+  },
+  pro_yearly: {
+    tier: "pro",
+    period: "yearly",
+    interval: 1,
+    // 2 months free => 10x monthly price
+    amountPaise: 649900 * 10, // ₹64,990.00
+    name: "Botify Pro (3,000 msgs) — Yearly",
+    envKey: "RP_PLAN_PRO_YEARLY",
+  },
+
+  // Pro Max — 15,000 msgs / month
+  promax_monthly: {
+    tier: "pro_max",
+    period: "monthly",
+    interval: 1,
+    amountPaise: 1999900, // ₹19,999.00
+    name: "Botify Pro Max (15,000 msgs) — Monthly",
+    envKey: "RP_PLAN_PROMAX_MONTHLY",
+  },
+  promax_yearly: {
+    tier: "pro_max",
+    period: "yearly",
+    interval: 1,
+    amountPaise: 1999900 * 10, // ₹199,990.00
+    name: "Botify Pro Max (15,000 msgs) — Yearly",
+    envKey: "RP_PLAN_PROMAX_YEARLY",
+  },
+
+  // Overage add-on (per 1k msgs) — used as subscription addon
+  overage_1k: {
+    name: "Overage 1,000 messages",
+    amountPaise: 65000, // ₹650
+  },
 };
 
-app.post("/api/create-order", async (req, res) => {
-  const { plan, userId, companyId } = req.body;
+// Message quotas per month (free is hard-capped)
+const MESSAGE_LIMITS = {
+  free: 150,
+  pro: 3000,
+  pro_max: 15000,
+  scale: Number.POSITIVE_INFINITY,
+};
 
-  // 1. Validate plan
-  if (!PLAN_PRICING[plan]) {
-    return res.status(400).json({ error: "Invalid plan selected." });
+// util to approximate tokens (kept only for logging/back-compat)
+function estimateTokenCount(text) {
+  return Math.ceil((text || "").length / 4);
+}
+
+/* ---------- INTERNAL Cron ---------- */
+
+app.post(
+  "/internal/overage-run",
+  basicAuth({
+    users: { [process.env.CRON_USER]: process.env.CRON_PASS },
+    challenge: true,
+  }),
+  async (_req, res) => {
+    try {
+      await nightlyOverageJob();
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("Overage CRON error", e);
+      return res.status(500).json({ error: e.message });
+    }
   }
+);
 
-  // 2. Prepare order details
-  const amount = PLAN_PRICING[plan];
-  const currency = "INR";
-  const shortId = (companyId || userId || "anon").slice(0, 10);
-  const receipt = `botify_${shortId}_${Date.now().toString().slice(-6)}`; // ~28–35 chars
+async function nightlyOverageJob() {
+  const snaps = await db.collection("companies").where("subscriptionId", "!=", null).get();
+  for (const doc of snaps.docs) {
+    const c = doc.data();
+    const limit   = MESSAGE_LIMITS[c.tier] ?? 0;
+    const used    = c.messagesUsedMonth || 0;
+    const over    = Math.max(0, used - limit);
+    const blocks  = Math.floor(over / 1000);      // charge in 1 k chunks
+    if (blocks === 0 || c.isOverageBilled) continue;
 
-  const options = {
-    amount, // in paise
-    currency,
-    receipt,
-    notes: { userId, companyId, plan },
-  };
+    try {
+      await razorpay.subscriptions.addAddon(c.subscriptionId, {
+        item: {
+          name: `Overage ${blocks * 1000} messages`,
+          amount: PLAN_CATALOG.overage_1k.amountPaise * blocks,
+          currency: "INR",
+        },
+        quantity: 1,
+      });
+      await doc.ref.update({ isOverageBilled: true });
+      console.log(`💸 Overage billed: ${doc.id} +${blocks}k`);
+    } catch (e) {
+      console.error("Failed to add overage addon", e);
+    }
+  }
+}
 
+/* ===========================================================
+   Razorpay Webhook — MUST run before express.json()
+   We verify signature and then handle subscription lifecycle.
+=========================================================== */
+// ──────────────────────────────────────────────────────────────
+//  Razorpay Webhook ‒ do business logic *before* marking logged
+// ──────────────────────────────────────────────────────────────
+app.post(
+  "/api/razorpay-webhook",
+  express.raw({ type: "application/json" }),        // keep raw-body for signature check
+  async (req, res) => {
+    const signature = req.headers["x-razorpay-signature"];
+    const secret    = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!signature || !secret) return res.status(400).send("Missing signature or secret");
+
+    /* ---------- verify HMAC ---------- */
+    let rawBody;
+    try { rawBody = req.body.toString("utf8"); }
+    catch { return res.status(400).send("Invalid raw body"); }
+
+    const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+    const validSig = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+    if (!validSig) {
+      console.warn("❌ Invalid Razorpay webhook signature");
+      return res.status(400).send("Invalid signature");
+    }
+
+    /* ---------- parse event ---------- */
+    let event;
+    try { event = JSON.parse(rawBody); }
+    catch { return res.status(400).send("Invalid JSON"); }
+
+    const evtType  = event?.event;
+    const dedupKey =
+      event?.payload?.subscription?.entity?.id ||
+      event?.payload?.invoice?.entity?.id      ||
+      event?.payload?.payment?.entity?.id      ||
+      `${evtType}:${event?.created_at || Date.now()}`;
+
+    const logRef = db.collection("webhookLogs").doc(dedupKey);
+    const existingLog = await logRef.get();
+    if (existingLog.exists && existingLog.data()?.processed)
+      return res.status(200).send("Already processed");
+
+    /* ------------------------------------------------------------------ */
+    try {
+      /* ======= 1.  MAIN BUSINESS LOGIC (unchanged) ======= */
+
+      /* --- subscription.* events --- */
+      if (evtType?.startsWith("subscription.")) {
+        const sub   = event?.payload?.subscription?.entity;
+        if (!sub) throw new Error("Missing subscription entity");
+
+        const notes        = sub.notes || {};
+        const userId       = notes.userId;
+        const companyIdRaw = notes.companyId;
+        const planKey      = notes.planKey;
+
+        const targetCompanyId =
+          companyIdRaw || (await getCompanyIdForUser(userId).catch(() => null));
+
+        if (targetCompanyId) {
+          const ref   = db.collection("companies").doc(targetCompanyId);
+          const data  = {
+            subscriptionId:     sub.id,
+            subscriptionStatus: sub.status,                 // active / paused / ...
+            tier:               PLAN_CATALOG[planKey]?.tier || "pro",
+            billingInterval:    planKey?.includes("yearly") ? "yearly" : "monthly",
+            currentPeriodEnd:   sub.current_end
+              ? Timestamp.fromDate(new Date(sub.current_end * 1000))
+              : null,
+            messagesUsedMonth: 0,
+            lastMsgAt:         Timestamp.now(),
+          };
+          await ref.set(data, { merge: true });
+          console.log(`✅ Company ${targetCompanyId} -> ${data.tier} [${sub.status}]`);
+        } else {
+          console.warn("Webhook: unable to resolve company for", sub.id);
+        }
+      }
+
+      /* --- invoice.paid --- */
+      else if (evtType === "invoice.paid") {
+        const inv   = event?.payload?.invoice?.entity;
+        const subId = inv?.subscription_id;
+        if (subId) {
+          const companies = await db
+            .collection("companies")
+            .where("subscriptionId", "==", subId)
+            .limit(1)
+            .get();
+
+          if (!companies.empty) {
+            const ref = companies.docs[0].ref;
+
+            let currentEndTs = null;
+            try {
+              const s = await razorpay.subscriptions.fetch(subId);
+              if (s?.current_end) currentEndTs = Timestamp.fromDate(new Date(s.current_end * 1000));
+            } catch {/* ignore – best-effort */}
+
+            await ref.set(
+              {
+                messagesUsedMonth: 0,
+                currentPeriodEnd:  currentEndTs || FieldValue.delete(),
+                subscriptionStatus:"active",
+                isOverageBilled:   false,
+              },
+              { merge: true }
+            );
+            console.log(`🧾 invoice.paid → reset month for ${ref.id}`);
+          }
+        }
+      }
+
+      /* --- payment.failed --- */
+      else if (evtType === "payment.failed") {
+        const pay   = event?.payload?.payment?.entity;
+        const subId = pay?.subscription_id;
+        if (subId) {
+          const companies = await db
+            .collection("companies")
+            .where("subscriptionId", "==", subId)
+            .limit(1)
+            .get();
+
+          if (!companies.empty) {
+            await companies.docs[0].ref.set(
+              { subscriptionStatus: "past_due" },
+              { merge: true }
+            );
+            console.warn(`⚠️ payment.failed → ${companies.docs[0].id} marked past_due`);
+          }
+        }
+      }
+
+      /* ======= 2. mark log as processed ======= */
+      await logRef.set({ ts: Timestamp.now(), evtType, raw: event, processed: true });
+    } catch (e) {
+      console.error("Webhook handler error:", e);
+
+      // store failure for manual retry ‒ *without* blocking Razorpay retries
+      await logRef.set({
+        ts: Timestamp.now(),
+        evtType,
+        raw: event,
+        error: e.message || "unknown",
+        processed: false,
+      });
+
+      // still HTTP-200 to avoid duplicate automatic retries – we track retry need via processed:false
+    }
+
+    return res.status(200).send("ok");
+  }
+);
+
+// After webhook route:
+app.use(express.json({ limit: "1mb" }));
+
+/* =========================
+   Helpers
+========================= */
+async function getCompanyIdForUser(userId) {
+  const s = await db.collection("users").doc(userId).get();
+  if (!s.exists) throw Object.assign(new Error("User not found"), { code: 404 });
+  const d = s.data();
+  if (!d?.companyId)
+    throw Object.assign(new Error("User has no company linked"), { code: 404 });
+  return d.companyId;
+}
+
+// In-memory created plan cache (for when env IDs are missing)
+const planCache = new Map();
+
+async function getOrCreateRazorpayPlan(planKey) {
+  const cfg = PLAN_CATALOG[planKey];
+  if (!cfg) throw Object.assign(new Error("Unknown planKey"), { code: 400 });
+
+  // Env override
+  const envId = process.env[cfg.envKey];
+  if (envId) return envId;
+
+  if (planCache.has(planKey)) return planCache.get(planKey);
+
+  // Create a plan on the fly (visible in Razorpay dashboard)
+  const period = cfg.period === "yearly" ? "year" : "month";
+  const plan = await razorpay.plans.create({
+    period, // "month" | "year"
+    interval: cfg.interval,
+    item: {
+      name: cfg.name,
+      amount: cfg.amountPaise,
+      currency: "INR",
+      description:
+        cfg.tier === "pro"
+          ? "Up to 3,000 messages / month"
+          : "Up to 15,000 messages / month",
+    },
+    notes: { planKey },
+  });
+
+  planCache.set(planKey, plan.id);
+  console.log(`🆕 Created Razorpay plan ${planKey} -> ${plan.id}`);
+  return plan.id;
+}
+
+/* =========================
+   Public: status & ping
+========================= */
+app.get("/", (req, res) => {
+  res.send("✅ Botify backend running (autopay + yearly enabled).");
+});
+
+/* Billing catalogue for frontend */
+const toRs = (paise) => Math.round(paise / 100); // 649900 → 6499
+
+app.get("/api/billing/plans", (_req, res) => {
+  res.json({
+    currency: "INR",
+    pro: {
+      monthly: {
+        price: toRs(PLAN_CATALOG.pro_monthly.amountPaise),
+        messages: 3000,
+        planKey: "pro_monthly",
+      },
+      yearly: {
+        price: toRs(PLAN_CATALOG.pro_yearly.amountPaise),
+        messages: 3000,
+        planKey: "pro_yearly",
+      },
+    },
+    proMax: {
+      monthly: {
+        price: toRs(PLAN_CATALOG.promax_monthly.amountPaise),
+        messages: 15000,
+        planKey: "promax_monthly",
+      },
+      yearly: {
+        price: toRs(PLAN_CATALOG.promax_yearly.amountPaise),
+        messages: 15000,
+        planKey: "promax_yearly",
+      },
+    },
+    overage: { per_1k: toRs(PLAN_CATALOG.overage_1k.amountPaise) },
+  });
+});
+
+/* ===========================================================
+   Billing: create a subscription (autopay)
+   Frontend opens Razorpay Checkout with subscription_id
+=========================================================== */
+app.post("/api/billing/subscribe", async (req, res) => {
   try {
-    const order = await razorpay.orders.create(options);
-    res.status(200).json({
-      orderId: order.id,
-      currency: order.currency,
-      amount: order.amount,
+    const { planKey, userId, companyId, customer } = req.body;
+    if (!planKey) return res.status(400).json({ error: "Missing planKey" });
+    const planId = await getOrCreateRazorpayPlan(planKey);
+
+    const targetCompanyId =
+      companyId || (userId ? await getCompanyIdForUser(userId) : null);
+    if (!targetCompanyId) return res.status(400).json({ error: "Missing companyId" });
+
+    // Create (or reuse) a Razorpay customer (optional but nice for invoices)
+    let customerId = null;
+    if (customer?.email) {
+      try {
+        const c = await razorpay.customers.create({
+          name: customer.name || "Botify User",
+          email: customer.email,
+          contact: customer.contact || undefined,
+          notes: { companyId: targetCompanyId, userId: userId || "" },
+        });
+        customerId = c.id;
+      } catch {
+        // ignore — customer is optional
+      }
+    }
+
+    // NOTE: total_count — if omitted/0, Razorpay treats it as "auto-renew till cancelled".
+    const sub = await razorpay.subscriptions.create({
+      plan_id: planId,
+      total_count: 0, // continue indefinitely
+      customer_notify: 1,
+      customer_id: customerId || undefined,
+      notes: { planKey, companyId: targetCompanyId, userId: userId || "" },
+      // charge_at: undefined // immediate
     });
-  } catch (err) {
-    console.error("❌ Razorpay order error:", err.message, err);
-    res.status(500).json({
-      error: err.message || "Failed to create Razorpay order",
+
+    // Store subscription shell immediately
+    await db.collection("companies").doc(targetCompanyId).set(
+      {
+        subscriptionId: sub.id,
+        subscriptionStatus: sub.status,
+        tier: PLAN_CATALOG[planKey].tier,
+        billingInterval: planKey.includes("yearly") ? "yearly" : "monthly",
+        currentPeriodEnd: sub.current_end
+          ? Timestamp.fromDate(new Date(sub.current_end * 1000))
+          : null,
+      },
+      { merge: true }
+    );
+
+    res.json({
+      subscriptionId: sub.id,
+      shortKey: planKey,
+      status: sub.status,
+      // Razorpay Checkout options you might want on the FE:
+      checkout: {
+        key: process.env.RAZORPAY_KEY_ID,
+        subscription_id: sub.id,
+        customer_id: customerId,
+        name: "Botify",
+        description: PLAN_CATALOG[planKey].name,
+        notes: { planKey, companyId: targetCompanyId },
+      },
     });
+  } catch (e) {
+    console.error("subscribe error", e);
+    res.status(500).json({ error: e.message || "Failed to create subscription" });
   }
 });
 
-/* ================================
-   FAQs Endpoint for the Widget
-   GET /api/faqs?userId=... OR ?companyId=...
-   Returns: [{ question, answer }, ...]
-================================= */
+/* ===========================================================
+   One-click add-on: 1 000 extra messages
+=========================================================== */
+app.post("/api/billing/buy-overage", async (req, res) => {
+  const { userId, blocks = 1 } = req.body;           // blocks → 1 k chunks
+  if (!userId)           return res.status(400).json({ error: "Missing userId" });
+  if (blocks < 1 || blocks > 20)
+    return res.status(400).json({ error: "Invalid blocks" });
 
-async function getCompanyIdForUser(userId) {
-  const userSnap = await db.collection("users").doc(userId).get();
-  if (!userSnap.exists) throw Object.assign(new Error("User not found"), { code: 404 });
-  const userData = userSnap.data();
-  if (!userData?.companyId)
-    throw Object.assign(new Error("User has no company linked"), { code: 404 });
-  return userData.companyId;
-}
+  try {
+    const companyId = await getCompanyIdForUser(userId);
+    const snap      = await db.collection("companies").doc(companyId).get();
+    const subId     = snap.data()?.subscriptionId;
+    if (!subId) return res.status(400).json({ error: "No active subscription" });
 
-function normalizeFaqDoc(d) {
-  const q = (d.q ?? d.question ?? d.title ?? "").toString().trim();
-  const a = (d.a ?? d.answer ?? "").toString().trim();
-  if (!q || !a) return null;
-  return { question: q, answer: a };
-}
+    const addon = await razorpay.subscriptions.addAddon(subId, {
+      item: {
+        name: `Pre-paid ${blocks * 1000} messages`,
+        amount: PLAN_CATALOG.overage_1k.amountPaise * blocks,
+        currency: "INR",
+      },
+      quantity: 1,
+    });
 
-// tiny in-memory rate limit: 120 req/min per IP (for this route only)
+    await snap.ref.update({ isOverageBilled: true });
+    return res.json({ ok: true, addonId: addon.id });
+  } catch (e) {
+    console.error("buy-overage error", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+/* ===========================================================
+   (Optional) Switch plan (creates a new subscription & cancels old at period end)
+=========================================================== */
+app.post("/api/billing/switch", async (req, res) => {
+  try {
+    const { planKey, companyId } = req.body;
+    if (!planKey || !companyId)
+      return res.status(400).json({ error: "Missing planKey/companyId" });
+
+    const doc = await db.collection("companies").doc(companyId).get();
+    const existing = doc.data();
+    if (existing?.subscriptionId) {
+      try {
+        await razorpay.subscriptions.cancel(existing.subscriptionId, { cancel_at_cycle_end: 1 });
+      } catch (e) {
+        console.warn("cancel old sub failed (ignore):", e?.error?.description || e.message);
+      }
+    }
+
+    // reuse /subscribe flow
+    req.body.userId = null;
+    return app._router.handle(req, res, require("finalhandler")(req, res));
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+/* ===========================================================
+   (Optional) Cancel now
+=========================================================== */
+app.post("/api/billing/cancel", async (req, res) => {
+  const { companyId } = req.body;
+  if (!companyId) return res.status(400).json({ error: "Missing companyId" });
+  const snap = await db.collection("companies").doc(companyId).get();
+  const subId = snap.data()?.subscriptionId;
+  if (!subId) return res.status(400).json({ error: "No subscription" });
+
+  try {
+    await razorpay.subscriptions.cancel(subId);
+    await snap.ref.set({ subscriptionStatus: "cancelled" }, { merge: true });
+    res.json({ cancelled: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ===========================================================
+   FAQs for Widget (unchanged except minor safety)
+=========================================================== */
 const hits = new Map();
 app.use("/api/faqs", (req, res, next) => {
   const ip =
-    req.ip ||
-    req.headers["x-forwarded-for"] ||
-    req.connection?.remoteAddress ||
-    "unknown";
+    req.ip || req.headers["x-forwarded-for"] || req.connection?.remoteAddress || "unknown";
   const now = Date.now();
   const cur = hits.get(ip) || { count: 0, resetAt: now + 60_000 };
-  if (now > cur.resetAt) {
-    cur.count = 0;
-    cur.resetAt = now + 60_000;
-  }
+  if (now > cur.resetAt) Object.assign(cur, { count: 0, resetAt: now + 60_000 });
   cur.count += 1;
   hits.set(ip, cur);
   if (cur.count > 120) return res.status(429).json({ error: "Too many requests" });
@@ -264,330 +596,278 @@ app.get("/api/faqs", async (req, res) => {
     const companyId = qCompanyId || (qUserId ? await getCompanyIdForUser(qUserId) : null);
     if (!companyId) return res.status(400).json({ error: "Missing userId/companyId" });
 
-    // (Optional: orderBy("updatedAt","desc")) if you store timestamps
     const snap = await db.collection("faqs").doc(companyId).collection("list").limit(200).get();
+    const faqs = snap.docs
+      .map((d) => {
+        const x = d.data();
+        const q = (x.q ?? x.question ?? x.title ?? "").toString().trim();
+        const a = (x.a ?? x.answer ?? "").toString().trim();
+        return q && a ? { question: q, answer: a } : null;
+      })
+      .filter(Boolean);
 
-    const faqs = snap.docs.map((doc) => normalizeFaqDoc(doc.data())).filter(Boolean);
-
-    // ETag + Conditional GET
     const etag = crypto.createHash("sha1").update(JSON.stringify(faqs)).digest("hex");
-    if (req.headers["if-none-match"] === etag) {
-      return res.status(304).end();
-    }
+    if (req.headers["if-none-match"] === etag) return res.status(304).end();
 
     res.setHeader("ETag", etag);
     res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     return res.json(faqs);
-  } catch (err) {
-    const code = err?.code === 404 ? 404 : 500;
-    return res.status(code).json({ error: err.message || "Failed to fetch FAQs" });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || "Failed to fetch FAQs" });
   }
 });
 
-/* ================================
-   Manual upgrade (dev only)
-================================= */
+/* ===========================================================
+   CHAT — now gated by **messages/month**
+   (tokens kept for logging/back-compat only)
+=========================================================== */
+app.use(
+  "/api/chat",
+  rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 min
+    max: 200,                 // 200 chats / IP / window
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
-app.post("/api/upgrade-tier", async (req, res) => {
-  if (process.env.NODE_ENV === "production") {
-    return res.status(403).json({ error: "Manual upgrade disabled in production." });
-  }
-
-  const { userId, plan } = req.body;
-  if (!userId || !plan) {
-    return res.status(400).json({ error: "Missing userId or plan" });
-  }
-
-  try {
-    const userSnap = await db.collection("users").doc(userId).get();
-    const userData = userSnap.data();
-    const companyId = userData?.companyId;
-
-    if (!companyId) {
-      return res.status(400).json({ error: "User has no company linked" });
-    }
-
-    const now = Timestamp.now();
-    const oneMonthLater = Timestamp.fromDate(
-      new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
-    ); // 30 days
-
-    await db
-      .collection("companies")
-      .doc(companyId)
-      .set(
-        {
-          tier: plan,
-          tokensUsedToday: 0,
-          lastReset: now,
-          subscriptionExpiresAt: oneMonthLater,
-        },
-        { merge: true }
-      );
-
-    res.json({ success: true, message: `Tier upgraded to ${plan}` });
-  } catch (err) {
-    console.error("🔥 Error upgrading tier:", err.message);
-    res.status(500).json({ error: "Internal Server Error" });
-  }
-});
-
-/* ================================
-   CHAT with company token limits
-================================= */
-
+// ──────────────────────────────────────────────────────────────
+//  POST  /api/chat           (CONCURRENCY-SAFE VERSION)
+// ──────────────────────────────────────────────────────────────
 app.post("/api/chat", async (req, res) => {
-  console.log("📩 /api/chat route hit!");
+  console.log("📩 /api/chat");
 
-  // 60s safeguard timeout for hung clients
-  res.setTimeout(60000, () => {
-    try {
-      res.write("\n[Error: timeout]");
-      res.end();
-    } catch {
-      res.end();
-    }
+  /* ---------- time-box the whole request to 60 s ---------- */
+  res.setTimeout(60_000, () => {
+    try { res.write("\n[Error: timeout]"); } finally { res.end(); }
   });
 
-  const { question } = req.body;
-  const userId = req.headers["x-user-id"] || "test-user";
+  /* ---------- validate input ---------- */
+  const userId   = req.headers["x-user-id"] || "test-user";
+  const qRaw     = typeof req.body.question === "string" ? req.body.question.trim() : "";
+  if (!qRaw)       return res.status(400).json({ error: "Missing or invalid question." });
+  if (qRaw.length > 2_000)
+    return res.status(400).json({ error: "Question too long (2 000 chars max)." });
+  if (qRaw.split(/\s+/).length < 4)
+    return res.status(400).json({ error: "Please ask a more specific question (≥ 4 words)." });
 
-  const userQuestion =
-    typeof question === "string" ? question.trim() : "";
-  if (!userQuestion) {
-    return res.status(400).json({ error: "Missing or invalid question." });
-  }
-  if (userQuestion.length > 2000) {
-    return res.status(400).json({ error: "Question too long." });
-  }
-
-  // 🔐 Firestore references
-  const userRef = db.collection("users").doc(userId);
-  const userDoc = await userRef.get();
-  if (!userDoc.exists) return res.status(404).json({ error: "User not found." });
-
-  const userData = userDoc.data();
-  const companyId = userData.companyId;
-  if (!companyId) return res.status(400).json({ error: "User not linked to a company." });
+  /* ---------- fetch user & company ---------- */
+  const userDoc = await db.collection("users").doc(userId).get();
+  if (!userDoc.exists)               return res.status(404).json({ error: "User not found." });
+  const companyId = userDoc.data()?.companyId;
+  if (!companyId)
+    return res.status(400).json({ error: "User not linked to a company." });
 
   const companyRef = db.collection("companies").doc(companyId);
   const companyDoc = await companyRef.get();
-  if (!companyDoc.exists) return res.status(404).json({ error: "Company not found." });
+  if (!companyDoc.exists)            return res.status(404).json({ error: "Company not found." });
 
-  const companyData = companyDoc.data();
-  const subscriptionExpiresAt = companyData?.subscriptionExpiresAt?.toDate?.();
+  /* ---------- quota — check & reserve atomically ---------- */
+  const reserveResult = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(companyRef);
+    const c    = snap.data() || {};
 
-  // 🛠️ Downgrade if expired + update local companyData
-  if (subscriptionExpiresAt && subscriptionExpiresAt < new Date()) {
-    await companyRef.update({
-      tier: "free",
-      subscriptionExpiresAt: null,
+    // soft-downgrade if subscription is paused / halted
+    const tierRaw = c.tier || "free";
+    const tier    =
+      ["halted", "paused"].includes(c.subscriptionStatus) ? "free" : tierRaw;
+
+    const monthlyLimit = MESSAGE_LIMITS[tier] ?? 150;
+    let   used         = c.messagesUsedMonth || 0;
+
+    // reset counter if billing cycle ended
+    const end   = c.currentPeriodEnd?.toDate?.();
+    const cycleReset = end && new Date() > end;
+    if (cycleReset) used = 0;
+
+    if (used >= monthlyLimit) return { allowed: false };       // hard stop
+
+    tx.update(companyRef, {
+      messagesUsedMonth: used + 1,          // **reserve one slot now**
+      lastMsgAt:         Timestamp.now(),
+      ...(cycleReset && { currentPeriodEnd: null, messagesUsedMonth: 1 }),
     });
-    companyData.tier = "free";
+    return { allowed: true, tier, monthlyLimit };
+  });
+
+  if (!reserveResult.allowed) {
+    return res
+      .status(403)
+      .json({ error: "Monthly message limit reached. Please upgrade to continue." });
   }
 
-  // 📊 Tier & token limits
-  let { tier = "free", tokensUsedToday = 0, lastReset } = companyData;
-  const tierLimits = { free: 1000, pro: 10000, pro_max: 66000 };
-  const monthlyCaps = { free: 30000, pro: 300000, pro_max: 2000000 };
-  const monthlyCap = monthlyCaps[tier] ?? 30000;
-  const tokensUsedMonth = companyData?.tokensUsedMonth || 0;
-
-  const dailyLimit = tierLimits[tier] ?? 1000;
-
-  const today = new Date().toDateString();
-  const lastResetDate = lastReset?.toDate?.()?.toDateString?.();
-
-  if (!lastReset || lastResetDate !== today) {
-    await companyRef.update({
-      tokensUsedToday: 0,
-      lastReset: Timestamp.now(),
-    });
-    tokensUsedToday = 0;
-  }
-
-  if (tokensUsedToday >= dailyLimit) {
-    return res.status(403).json({
-      error: "❌ Company token limit exceeded. Please upgrade to continue.",
-    });
-  }
-
-  // 📋 Load and sanitize FAQs (prefer client-provided to save a DB read)
+  /* ---------- fetch FAQs (cached by caller if provided) ---------- */
   let faqs = Array.isArray(req.body.faqs) ? req.body.faqs : [];
   try {
     if (!faqs.length) {
-      const faqSnap = await db
+      const snap = await db
         .collection("faqs")
         .doc(companyId)
         .collection("list")
         .get();
-      faqs = faqSnap.docs.map((doc) => doc.data());
+      faqs = snap.docs.map((d) => d.data());
     }
-
     faqs = faqs
       .map((f) => ({
         q: (f.q ?? f.question ?? f.title ?? "").toString().trim(),
-        a: (f.a ?? f.answer ?? "").toString().trim(),
+        a: (f.a ?? f.answer  ?? "").toString().trim(),
       }))
       .filter((f) => f.q && f.a);
-  } catch (err) {
-    console.warn("⚠️ FAQ fetch failed:", err.message);
+  } catch (e) {
+    console.warn("FAQ fetch failed:", e.message);
   }
 
-  function normalize(str) {
-    return str?.trim().toLowerCase().replace(/[^\w\s]/gi, "").replace(/\s+/g, " ");
-  }
+  const normalize = (s) =>
+    s.trim().toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ");
 
-  // ✅ 1. Exact Match
-  const exactMatch = faqs.find((f) => normalize(f.q) === normalize(userQuestion));
-  if (exactMatch) {
-    const reply = exactMatch.a;
-    const replyTokens = estimateTokenCount(reply);
-    await companyRef.update({ tokensUsedToday: FieldValue.increment(replyTokens) });
-    res.setHeader("Content-Type", "text/plain");
-    res.write(reply);
+  /* ---------- exact FAQ match ---------- */
+  const exact = faqs.find((f) => normalize(f.q) === normalize(qRaw));
+  if (exact) {
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.write(exact.a);
     return res.end();
   }
 
-  // ✅ 2. Fuzzy Match — SAFE version
+  /* ---------- fuzzy FAQ match ---------- */
   try {
-    const cleanedMatches = faqs
-      .map((f) => (typeof f.q === "string" ? f.q.trim() : null))
-      .filter((q) => typeof q === "string" && q.length > 0);
-
-    if (cleanedMatches.length > 0) {
-      const { bestMatch, bestMatchIndex } = stringSimilarity.findBestMatch(
-        userQuestion,
-        cleanedMatches
-      );
-
+    const qs = faqs.map((f) => f.q);
+    if (qs.length) {
+      const { bestMatch, bestMatchIndex } = stringSimilarity.findBestMatch(qRaw, qs);
       if (bestMatch?.rating > 0.9) {
-        const reply = faqs[bestMatchIndex]?.a || "";
-        const replyTokens = estimateTokenCount(reply);
-        await companyRef.update({ tokensUsedToday: FieldValue.increment(replyTokens) });
-
-        res.setHeader("Content-Type", "text/plain");
-        res.write(reply);
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.write(faqs[bestMatchIndex].a);
         return res.end();
       }
     }
   } catch (e) {
-    console.warn("❌ Fuzzy matching failed safely:", e.message);
+    console.warn("Fuzzy match failed:", e.message);
   }
 
-  // 🤖 3. DeepSeek Fallback
-  const formattedFAQ = faqs
+  /* ---------- LLM fallback ---------- */
+  const faqPrefix = faqs
     .slice(0, 5)
-    .map((f, i) => `${i + 1}. Q: ${f.q}\nA: ${f.a}`)
+    .map((f, i) => `${i + 1}. Q: ${f.q}\n   A: ${f.a}`)
     .join("\n");
 
-  const prompt = faqs.length
-    ? `You are an AI customer support assistant. Use the following FAQs to help answer the user's question:\n\n${formattedFAQ}\n\nUser: ${userQuestion}\nAnswer:`
-    : `You are an AI customer support assistant. Answer the following question:\n\n${userQuestion}\nAnswer:`;
-
-  const estimatedPromptTokens = estimateTokenCount(prompt);
-  const estimatedOutputTokens = 100;
-  const totalEstimated = estimatedPromptTokens + estimatedOutputTokens;
-
-  if (tokensUsedToday + totalEstimated > dailyLimit) {
-    return res.status(403).json({
-      error: "❌ Company token limit exceeded. Please upgrade to continue.",
-    });
-  }
-
-  if (tokensUsedMonth + totalEstimated > monthlyCap) {
-    return res.status(403).json({
-      error: "❌ Monthly token cap reached. Please wait for renewal or upgrade.",
-    });
-  }
+  const prompt =
+    (faqs.length
+      ? `You are an AI customer-support assistant.\nUse these FAQs if helpful:\n${faqPrefix}\n\n`
+      : "You are an AI customer-support assistant.\n\n") +
+    `User: ${qRaw}\nAnswer (concise):`;
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Transfer-Encoding", "chunked");
   res.setHeader("Cache-Control", "no-cache");
 
   let replyText = "";
+  const promptTokens = estimateTokenCount(prompt); // legacy metric
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: "deepseek-chat",
+    /* ──────────────── 1. Call DeepSeek in streaming mode ──────────────── */
+    const stream = await openai.chat.completions.create({
+      model:    "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
-      stream: true,
+      stream:   true,
     });
 
-    for await (const chunk of completion) {
+    /* ──────────────── 2. Proxy chunks to the client ──────────────── */
+    for await (const chunk of stream) {
       const delta = chunk?.choices?.[0]?.delta?.content || "";
       if (delta) {
-        replyText += delta;
-        res.write(delta);
+        replyText += delta;       // assemble full assistant reply
+        res.write(delta);         // stream to browser
       }
     }
-  } catch (err) {
-    console.error("❌ Streaming error:", err);
+  } catch (e) {
+    /* Any network / model error -> emit marker so FE can react */
+    console.error("Streaming error:", e);
     res.write("\n[Error: generation failed]");
   } finally {
-    try {
-      await db.runTransaction(async (transaction) => {
-        const docSnap = await transaction.get(companyRef);
-        const company = docSnap.data();
-        const lastResetDate2 = company?.lastReset?.toDate()?.toDateString?.();
-        const today2 = new Date().toDateString();
+    /* ──────────────── 3. Telemetry (optional) ────────────────
+      • Message quota was already *reserved* at txn-start, so
+        we DO NOT touch `messagesUsedMonth` again here.
+      • We can still log an *approx* token cost for analytics.
+    ---------------------------------------------------------------- */
+    const approxTokens =
+      promptTokens +                       // prompt that we sent
+      estimateTokenCount(replyText);       // assistant response size
 
-        const replyTokens = estimateTokenCount(replyText);
-        const totalTokensToAdd = estimatedPromptTokens + replyTokens;
+    db.collection("companies")
+      .doc(companyId)
+      .update({
+        /* purely legacy stats – safe to drop any time */
+        tokensUsedMonthLegacy: FieldValue.increment(approxTokens),
+      })
+      .catch((err) =>
+        console.warn("Legacy token telemetry failed:", err.message)
+      );
 
-        if (!lastResetDate2 || lastResetDate2 !== today2) {
-          transaction.update(companyRef, {
-            tokensUsedToday: totalTokensToAdd,
-            tokensUsedMonth: FieldValue.increment(totalTokensToAdd),
-            lastReset: Timestamp.now(),
-          });
-        } else {
-          transaction.update(companyRef, {
-            tokensUsedToday: FieldValue.increment(totalTokensToAdd),
-            tokensUsedMonth: FieldValue.increment(totalTokensToAdd),
-          });
-        }
-      });
-    } catch (e) {
-      console.warn("⚠️ Token update failed:", e.message);
-    }
-
+    /* done – flush the response */
     res.end();
   }
+
 });
 
-/* ================================
-   Razorpay Payment Verification
-================================= */
 
-app.post("/api/verify-payment", async (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+/* ===========================================================
+   Usage status for widget (now message-based)
+=========================================================== */
+app.get("/api/usage-status", async (req, res) => {
+  const userId = req.headers["x-user-id"];
+  if (!userId) return res.status(400).json({ error: "Missing userId" });
 
-  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-    return res.status(400).json({ success: false, message: "Missing payment details." });
-  }
+  const userSnap = await db.collection("users").doc(userId).get();
+  const companyId = userSnap.data()?.companyId;
+  if (!companyId) return res.status(404).json({ error: "User has no company linked" });
 
-  const secret = process.env.RAZORPAY_SECRET;
+  const cSnap = await db.collection("companies").doc(companyId).get();
+  const c = cSnap.data();
+  if (!c) return res.status(404).json({ error: "Company not found" });
 
-  // Generate the expected signature
-  const generatedSignature = crypto
-    .createHmac("sha256", secret)
-    .update(razorpay_order_id + "|" + razorpay_payment_id)
-    .digest("hex");
+  let tier = c.tier || "free";
+  const limit = MESSAGE_LIMITS[tier] ?? 150;
+  const used = c.messagesUsedMonth || 0;
 
-  if (generatedSignature === razorpay_signature) {
-    console.log("✅ Payment verification successful for order:", razorpay_order_id);
-    res.json({ success: true, message: "Payment verified successfully." });
-  } else {
-    console.warn("❌ Payment verification failed for order:", razorpay_order_id);
-    res.status(400).json({ success: false, message: "Invalid signature." });
-  }
+  // Safety: if cycle ended, show 0 used
+  const cycleEnd = c.currentPeriodEnd?.toDate?.();
+  const reset = cycleEnd && new Date() > cycleEnd;
+  const usage = reset ? 0 : used;
+
+  // If past_due/halted, block paid features
+  const blocked =
+    (tier === "free" && usage >= limit) ||
+    ["past_due", "halted", "paused"].includes(c.subscriptionStatus || "");
+
+  return res.json({
+    usage,
+    limit,
+    blocked,
+    subscriptionStatus: c.subscriptionStatus || null,
+    currentPeriodEnd: c.currentPeriodEnd || null,
+    tier,
+  });
 });
 
-/* ================================
-   Company registration
-================================= */
+/* ===========================================================
+   Legacy one-time order endpoints (kept for compatibility)
+   — You can remove later. Prefer /api/billing/subscribe.
+=========================================================== */
+app.post("/api/create-order", async (req, res) => {
+  return res.status(410).json({
+    error:
+      "Deprecated. Use /api/billing/subscribe for autopay subscriptions (monthly/yearly).",
+  });
+});
 
+app.post("/api/verify-payment", async (_req, res) => {
+  return res
+    .status(410)
+    .json({ success: false, message: "Deprecated. Using subscriptions now." });
+});
+
+/* ===========================================================
+   Company registration (unchanged)
+=========================================================== */
 app.post("/api/register-company", async (req, res) => {
   const { userId, companyName } = req.body;
   if (!userId || !companyName) return res.status(400).json({ error: "Missing fields." });
@@ -596,92 +876,20 @@ app.post("/api/register-company", async (req, res) => {
     const companyDoc = await db.collection("companies").add({
       name: companyName,
       tier: "free",
+      messagesUsedMonth: 0,
       createdAt: Timestamp.now(),
     });
 
-    await db.collection("users").doc(userId).update({
-      companyId: companyDoc.id,
-    });
+    await db.collection("users").doc(userId).update({ companyId: companyDoc.id });
 
     res.json({ message: "Company registered & user linked.", companyId: companyDoc.id });
   } catch (err) {
-    console.error("❌ Company registration error:", err.message);
+    console.error("Company registration error:", err.message);
     res.status(500).json({ error: "Failed to register company." });
   }
 });
 
-/* ================================
-   Usage status (for widget)
-================================= */
-
-app.get("/api/usage-status", async (req, res) => {
-  const userId = req.headers["x-user-id"];
-  if (!userId) return res.status(400).json({ error: "Missing userId" });
-
-  // 🔐 Fetch user and company
-  const userSnap = await db.collection("users").doc(userId).get();
-  const userData = userSnap.data();
-  const companyId = userData?.companyId;
-
-  if (!companyId) {
-    return res.status(404).json({ error: "User has no company linked" });
-  }
-
-  const companyRef = db.collection("companies").doc(companyId);
-  const companySnap = await companyRef.get();
-  const companyData = companySnap.data();
-
-  if (!companyData) {
-    return res.status(404).json({ error: "Company not found" });
-  }
-
-  // ⏳ Subscription expiry logic
-  const subscriptionExpiresAtRaw = companyData?.subscriptionExpiresAt;
-  const subscriptionExpiresAt = subscriptionExpiresAtRaw?.toDate?.();
-  let { tier = "free", tokensUsedToday = 0, lastReset } = companyData;
-
-  if (subscriptionExpiresAt && subscriptionExpiresAt < new Date()) {
-    await companyRef.update({
-      tier: "free",
-      subscriptionExpiresAt: null,
-    });
-    tier = "free";
-  }
-
-  const tierLimits = { free: 1000, pro: 10000, pro_max: 66000 };
-  const dailyLimit = tierLimits[tier] ?? 1000;
-
-  // 🔄 Reset if new day
-  const today = new Date().toDateString();
-  const lastResetDate = lastReset?.toDate?.()?.toDateString?.();
-
-  // (Keep dailyReset.js as the main reset, this is just a safety)
-  if (!lastReset || lastResetDate !== today) {
-    console.log("⚠️ Resetting tokens due to date mismatch:", lastResetDate, today);
-    await companyRef.update({
-      tokensUsedToday: 0,
-      lastReset: Timestamp.now(),
-    });
-    return res.json({
-      usage: 0,
-      limit: dailyLimit,
-      blocked: false,
-      subscriptionExpiresAt: tier === "free" ? null : subscriptionExpiresAtRaw,
-    });
-  }
-
-  const blocked = tokensUsedToday >= dailyLimit;
-
-  return res.json({
-    usage: tokensUsedToday,
-    limit: dailyLimit,
-    blocked,
-    subscriptionExpiresAt: tier === "free" ? null : subscriptionExpiresAtRaw,
-  });
-});
-
-/* ================================
+/* ===========================================================
    Start server
-================================= */
-
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+=========================================================== */
+app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
