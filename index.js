@@ -25,14 +25,28 @@ app.set("trust proxy", 1);
 /* ──────────────────────────────────
    CORS
 ─────────────────────────────────── */
+const WHITELIST = [
+  "https://ai-chatbot-saas-eight.vercel.app",
+  "http://localhost:5173",
+];
+
 app.use(
   cors({
     origin:        true,
     methods:       ["GET", "POST"],
     allowedHeaders:["Content-Type", "x-user-id"],
     credentials:   true,
+    origin:        (o, cb) => cb(null, WHITELIST.includes(o) || !o),
+    credentials:   true,
+    methods:       ["GET", "POST", "OPTIONS"],
+    allowedHeaders:["Content-Type", "x-user-id"],
+    optionsSuccessStatus: 204,    
   })
 );
+
+/** IMPORTANT: make Express answer the pre-flight before any route */
+app.options("*", cors());
+
 app.use(helmet());
 
 /* ──────────────────────────────────
