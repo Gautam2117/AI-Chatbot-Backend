@@ -1,133 +1,131 @@
-// server.js (autopay + yearly + message quotas)
+/*  Botify – backend
+    Subscription billing (autopay), yearly cycles, message quotas
+----------------------------------------------------------------- */
 
 import "./dailyReset.js";
-import rateLimit from "express-rate-limit";
-import helmet from "helmet"
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import OpenAI from "openai";
-import Razorpay from "razorpay";
-import crypto from "crypto";
+import rateLimit          from "express-rate-limit";
+import helmet             from "helmet";
+import express            from "express";
+import cors               from "cors";
+import dotenv             from "dotenv";
+import OpenAI             from "openai";
+import Razorpay           from "razorpay";
+import crypto             from "crypto";
 import { Timestamp, FieldValue } from "firebase-admin/firestore";
-import { db } from "./firebase.js";
-import stringSimilarity from "string-similarity";
-import basicAuth from "express-basic-auth";
+import { db }             from "./firebase.js";
+import stringSimilarity   from "string-similarity";
+import basicAuth          from "express-basic-auth";
 
 dotenv.config();
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 5000;
 app.set("trust proxy", 1);
 
-/* =========================
+/* ──────────────────────────────────
    CORS
-========================= */
+─────────────────────────────────── */
 app.use(
   cors({
-    origin: true,
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type", "x-user-id"],
-    credentials: true,
+    origin:        true,
+    methods:       ["GET", "POST"],
+    allowedHeaders:["Content-Type", "x-user-id"],
+    credentials:   true,
   })
 );
-
 app.use(helmet());
 
-/* =========================
+/* ──────────────────────────────────
    Razorpay client
-========================= */
+─────────────────────────────────── */
 const keyId     = process.env.RAZORPAY_KEY_ID;
 const keySecret = process.env.RAZORPAY_SECRET;
+if (!keyId || !keySecret)
+  throw new Error("Razorpay keys not found in environment.");
 
-if (!keyId || !keySecret) {
-  throw new Error(
-    "Razorpay keys not found in environment. Refusing to start."
-  );
-}
+const razorpay  = new Razorpay({ key_id: keyId, key_secret: keySecret });
 
-const razorpay = new Razorpay({ key_id: keyId, key_secret: keySecret });
-
-/* =========================
-   OpenAI / DeepSeek
-========================= */
+/* ──────────────────────────────────
+   DeepSeek / OpenAI wrapper
+─────────────────────────────────── */
 if (!process.env.DEEPSEEK_API_KEY) throw new Error("Missing DEEPSEEK_API_KEY");
-if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_SECRET)
-  throw new Error("Missing Razorpay keys");
 
 const openai = new OpenAI({
-  apiKey: process.env.DEEPSEEK_API_KEY,
+  apiKey : process.env.DEEPSEEK_API_KEY,
   baseURL: "https://api.deepseek.com",
 });
 
-process.on("unhandledRejection", (err) => {
-  console.error("UNHANDLED REJECTION:", err);
-});
+process.on("unhandledRejection", (err) => console.error("UNHANDLED:", err));
 
-/* =========================
-   Plans (INR, paise)
-   - You can pre-create plans in Razorpay and put IDs in .env
-   - If an ID is missing, server will create a plan on demand (and cache it in memory)
-========================= */
+/* ──────────────────────────────────
+   Plan catalogue (prices in paise)
+─────────────────────────────────── */
 const PLAN_CATALOG = {
-  // Pro — 3,000 msgs / month
-  pro_monthly: {
-    tier: "pro",
-    period: "monthly",
-    interval: 1,
-    amountPaise: 649900, // ₹6,499.00
-    name: "Botify Pro (3,000 msgs) — Monthly",
-    envKey: "RP_PLAN_PRO_MONTHLY",
+  /* Starter – 3 000 msgs / mo */
+  starter_monthly: {
+    tier: "starter", period: "monthly", interval: 1,
+    amountPaise: 159_900,                              // ₹1 599.00
+    name: "Botify Starter (3 000 msgs) — Monthly",
+    envKey: "RP_PLAN_STARTER_MONTHLY",
   },
-  pro_yearly: {
-    tier: "pro",
-    period: "yearly",
-    interval: 1,
-    // 2 months free => 10x monthly price
-    amountPaise: 649900 * 10, // ₹64,990.00
-    name: "Botify Pro (3,000 msgs) — Yearly",
-    envKey: "RP_PLAN_PRO_YEARLY",
+  starter_yearly:  {
+    tier: "starter", period: "yearly",  interval: 1,
+    amountPaise: 1_599_900,                            // ₹15 990.00 (2 mo free)
+    name: "Botify Starter (3 000 msgs) — Yearly",
+    envKey: "RP_PLAN_STARTER_YEARLY",
   },
 
-  // Pro Max — 15,000 msgs / month
-  promax_monthly: {
-    tier: "pro_max",
-    period: "monthly",
-    interval: 1,
-    amountPaise: 1999900, // ₹19,999.00
-    name: "Botify Pro Max (15,000 msgs) — Monthly",
-    envKey: "RP_PLAN_PROMAX_MONTHLY",
+  /* Growth – 15 000 msgs / mo */
+  growth_monthly: {
+    tier: "growth", period: "monthly", interval: 1,
+    amountPaise: 489_900,                              // ₹4 899.00
+    name: "Botify Growth (15 000 msgs) — Monthly",
+    envKey: "RP_PLAN_GROWTH_MONTHLY",
   },
-  promax_yearly: {
-    tier: "pro_max",
-    period: "yearly",
-    interval: 1,
-    amountPaise: 1999900 * 10, // ₹199,990.00
-    name: "Botify Pro Max (15,000 msgs) — Yearly",
-    envKey: "RP_PLAN_PROMAX_YEARLY",
+  growth_yearly:  {
+    tier: "growth", period: "yearly",  interval: 1,
+    amountPaise: 4_899_000,                            // ₹48 990.00
+    name: "Botify Growth (15 000 msgs) — Yearly",
+    envKey: "RP_PLAN_GROWTH_YEARLY",
   },
 
-  // Overage add-on (per 1k msgs) — used as subscription addon
+  /* Scale – 50 000 msgs / mo */
+  scale_monthly: {
+    tier: "scale", period: "monthly", interval: 1,
+    amountPaise: 1_239_900,                            // ₹12 399.00
+    name: "Botify Scale (50 000 msgs) — Monthly",
+    envKey: "RP_PLAN_SCALE_MONTHLY",
+  },
+  scale_yearly:  {
+    tier: "scale", period: "yearly",  interval: 1,
+    amountPaise: 12_399_000,                           // ₹123 990.00
+    name: "Botify Scale (50 000 msgs) — Yearly",
+    envKey: "RP_PLAN_SCALE_YEARLY",
+  },
+
+  /* Overage add-on */
   overage_1k: {
-    name: "Overage 1,000 messages",
-    amountPaise: 65000, // ₹650
+    name: "Overage 1 000 messages",
+    amountPaise: 32_900,                               // ₹329.00
   },
 };
 
-// Message quotas per month (free is hard-capped)
+/* ──────────────────────────────────
+   Monthly hard caps
+─────────────────────────────────── */
 const MESSAGE_LIMITS = {
-  free: 150,
-  pro: 3000,
-  pro_max: 15000,
-  scale: Number.POSITIVE_INFINITY,
+  free:    150,
+  starter: 3_000,
+  growth:  15_000,
+  scale:   50_000,
 };
 
-// util to approximate tokens (kept only for logging/back-compat)
-function estimateTokenCount(text) {
-  return Math.ceil((text || "").length / 4);
-}
+/* helper – rough token estimator (legacy analytics) */
+const estTokens = (s = "") => Math.ceil(s.length / 4);
 
-/* ---------- INTERNAL Cron ---------- */
+/* ╔═══════════════════════════════════════════════════════╗
+   ║                INTERNAL  CRON  JOBS                   ║
+   ╚═══════════════════════════════════════════════════════╝ */
 
 app.post(
   "/internal/overage-run",
@@ -138,288 +136,336 @@ app.post(
   async (_req, res) => {
     try {
       await nightlyOverageJob();
-      return res.json({ ok: true });
+      res.json({ ok: true });
     } catch (e) {
       console.error("Overage CRON error", e);
-      return res.status(500).json({ error: e.message });
+      res.status(500).json({ error: e.message });
     }
   }
 );
 
 async function nightlyOverageJob() {
   const snaps = await db.collection("companies").where("subscriptionId", "!=", null).get();
+
   for (const doc of snaps.docs) {
-    const c = doc.data();
+    const c       = doc.data();
     const limit   = MESSAGE_LIMITS[c.tier] ?? 0;
     const used    = c.messagesUsedMonth || 0;
     const over    = Math.max(0, used - limit);
-    const blocks  = Math.floor(over / 1000);      // charge in 1 k chunks
+    const blocks  = Math.floor(over / 1_000);
     if (blocks === 0 || c.isOverageBilled) continue;
 
     try {
       await razorpay.addons.create({
         subscription_id: c.subscriptionId,
         item: {
-          name: `Overage ${blocks * 1000} messages`,
-          amount: PLAN_CATALOG.overage_1k.amountPaise * blocks,
+          name:     `Overage ${blocks * 1_000} messages`,
+          amount:   PLAN_CATALOG.overage_1k.amountPaise * blocks,
           currency: "INR",
         },
         quantity: 1,
       });
       await doc.ref.update({ isOverageBilled: true });
-      console.log(`💸 Overage billed: ${doc.id} +${blocks}k`);
+      console.log(`💸 Overage billed for ${doc.id}: +${blocks}k`);
     } catch (e) {
-      console.error("Failed to add overage addon", e);
+      console.error("Add-on create failed:", e);
     }
   }
 }
 
-/* ===========================================================
-   Razorpay Webhook — MUST run before express.json()
-   We verify signature and then handle subscription lifecycle.
-=========================================================== */
-// ──────────────────────────────────────────────────────────────
-//  Razorpay Webhook ‒ do business logic *before* marking logged
-// ──────────────────────────────────────────────────────────────
+/* ╔═══════════════════════════════════════════════════════╗
+   ║                   RAZORPAY  WEBHOOK                   ║
+   ╚═══════════════════════════════════════════════════════╝ */
+
 app.post(
   "/api/razorpay-webhook",
-  express.raw({ type: "application/json" }),        // keep raw-body for signature check
+  express.raw({ type: "application/json" }),            // keep raw body
   async (req, res) => {
-    const signature = req.headers["x-razorpay-signature"];
-    const secret    = process.env.RAZORPAY_WEBHOOK_SECRET;
-    if (!signature || !secret) return res.status(400).send("Missing signature or secret");
+    const sigHdr = req.headers["x-razorpay-signature"];
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!sigHdr || !secret) return res.status(400).send("Missing signature/secret");
 
-    /* ---------- verify HMAC ---------- */
-    let rawBody;
-    try { rawBody = req.body.toString("utf8"); }
-    catch { return res.status(400).send("Invalid raw body"); }
+    /* verify HMAC */
+    let raw;
+    try { raw = req.body.toString("utf8"); }
+    catch { return res.status(400).send("Bad raw body"); }
 
-    const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-    const validSig = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
-    if (!validSig) {
-      console.warn("❌ Invalid Razorpay webhook signature");
+    const expected = crypto.createHmac("sha256", secret).update(raw).digest("hex");
+    if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sigHdr)))
       return res.status(400).send("Invalid signature");
-    }
 
-    /* ---------- parse event ---------- */
     let event;
-    try { event = JSON.parse(rawBody); }
-    catch { return res.status(400).send("Invalid JSON"); }
+    try { event = JSON.parse(raw); }
+    catch { return res.status(400).send("Bad JSON"); }
 
-    const evtType  = event?.event;
-    const dedupKey =
-      event?.payload?.subscription?.entity?.id ||
-      event?.payload?.invoice?.entity?.id      ||
-      event?.payload?.payment?.entity?.id      ||
-      `${evtType}:${event?.created_at || Date.now()}`;
+    const evt   = event?.event;
+    const dedup = event?.payload?.subscription?.entity?.id
+               || event?.payload?.invoice?.entity?.id
+               || event?.payload?.payment?.entity?.id
+               || `${evt}:${event?.created_at}`;
 
-    const logRef = db.collection("webhookLogs").doc(dedupKey);
-    const existingLog = await logRef.get();
-    if (existingLog.exists && existingLog.data()?.processed)
-      return res.status(200).send("Already processed");
+    const logRef = db.collection("webhookLogs").doc(dedup);
+    if ((await logRef.get()).data()?.processed) return res.status(200).end("dup");
 
-    /* ------------------------------------------------------------------ */
     try {
-      /* ======= 1.  MAIN BUSINESS LOGIC (unchanged) ======= */
-
-      /* --- subscription.* events --- */
-      if (evtType?.startsWith("subscription.")) {
-        const sub   = event?.payload?.subscription?.entity;
-        if (!sub) throw new Error("Missing subscription entity");
-
-        const notes        = sub.notes || {};
-        const userId       = notes.userId;
-        const companyIdRaw = notes.companyId;
-        const planKey      = notes.planKey;
-
-        const targetCompanyId =
-          companyIdRaw || (await getCompanyIdForUser(userId).catch(() => null));
-
-        if (targetCompanyId) {
-          const ref   = db.collection("companies").doc(targetCompanyId);
-          const data  = {
+      /* subscription.* */
+      if (evt?.startsWith("subscription.")) {
+        const sub   = event.payload.subscription.entity;
+        const notes = sub.notes || {};
+        const companyId = notes.companyId || (await getCompanyIdForUser(notes.userId).catch(() => null));
+        if (companyId) {
+          await db.collection("companies").doc(companyId).set({
             subscriptionId:     sub.id,
-            subscriptionStatus: sub.status,                 // active / paused / ...
-            tier:               PLAN_CATALOG[planKey]?.tier || "pro",
-            billingInterval:    planKey?.includes("yearly") ? "yearly" : "monthly",
-            currentPeriodEnd:   sub.current_end
-              ? Timestamp.fromDate(new Date(sub.current_end * 1000))
-              : null,
-            messagesUsedMonth: 0,
-            lastMsgAt:         Timestamp.now(),
-          };
-          await ref.set(data, { merge: true });
-          console.log(`✅ Company ${targetCompanyId} -> ${data.tier} [${sub.status}]`);
-        } else {
-          console.warn("Webhook: unable to resolve company for", sub.id);
+            subscriptionStatus: sub.status,
+            tier:               PLAN_CATALOG[notes.planKey]?.tier || "starter",
+            billingInterval:    notes.planKey?.includes("yearly") ? "yearly" : "monthly",
+            currentPeriodEnd:   sub.current_end ? Timestamp.fromDate(new Date(sub.current_end * 1_000)) : null,
+            messagesUsedMonth:  0,
+            lastMsgAt:          Timestamp.now(),
+          }, { merge: true });
+          console.log(`✅ Webhook: ${companyId} set to ${sub.status}`);
         }
       }
 
-      /* --- invoice.paid --- */
-      else if (evtType === "invoice.paid") {
-        const inv   = event?.payload?.invoice?.entity;
-        const subId = inv?.subscription_id;
+      /* invoice.paid */
+      else if (evt === "invoice.paid") {
+        const inv   = event.payload.invoice.entity;
+        const subId = inv.subscription_id;
         if (subId) {
-          const companies = await db
-            .collection("companies")
-            .where("subscriptionId", "==", subId)
-            .limit(1)
-            .get();
-
-          if (!companies.empty) {
-            const ref = companies.docs[0].ref;
-
-            let currentEndTs = null;
+          const comp = await db.collection("companies").where("subscriptionId", "==", subId).limit(1).get();
+          if (!comp.empty) {
+            const ref = comp.docs[0].ref;
+            let endTs = null;
             try {
               const s = await razorpay.subscriptions.fetch(subId);
-              if (s?.current_end) currentEndTs = Timestamp.fromDate(new Date(s.current_end * 1000));
-            } catch {/* ignore – best-effort */}
-
-            await ref.set(
-              {
-                messagesUsedMonth: 0,
-                currentPeriodEnd:  currentEndTs || FieldValue.delete(),
-                subscriptionStatus:"active",
-                isOverageBilled:   false,
-              },
-              { merge: true }
-            );
-            console.log(`🧾 invoice.paid → reset month for ${ref.id}`);
+              if (s?.current_end) endTs = Timestamp.fromDate(new Date(s.current_end * 1_000));
+            } catch {}
+            await ref.set({
+              messagesUsedMonth: 0,
+              currentPeriodEnd:  endTs || FieldValue.delete(),
+              subscriptionStatus:"active",
+              isOverageBilled:   false,
+            }, { merge: true });
           }
         }
       }
 
-      /* --- payment.failed --- */
-      else if (evtType === "payment.failed") {
-        const pay   = event?.payload?.payment?.entity;
-        const subId = pay?.subscription_id;
+      /* payment.failed */
+      else if (evt === "payment.failed") {
+        const pay   = event.payload.payment.entity;
+        const subId = pay.subscription_id;
         if (subId) {
-          const companies = await db
-            .collection("companies")
-            .where("subscriptionId", "==", subId)
-            .limit(1)
-            .get();
-
-          if (!companies.empty) {
-            await companies.docs[0].ref.set(
-              { subscriptionStatus: "past_due" },
-              { merge: true }
-            );
-            console.warn(`⚠️ payment.failed → ${companies.docs[0].id} marked past_due`);
-          }
+          const comp = await db.collection("companies").where("subscriptionId", "==", subId).limit(1).get();
+          if (!comp.empty)
+            await comp.docs[0].ref.set({ subscriptionStatus: "past_due" }, { merge: true });
         }
       }
 
-      /* ======= 2. mark log as processed ======= */
-      await logRef.set({ ts: Timestamp.now(), evtType, raw: event, processed: true });
+      await logRef.set({ ts: Timestamp.now(), evt, raw: event, processed: true });
     } catch (e) {
-      console.error("Webhook handler error:", e);
-
-      // store failure for manual retry ‒ *without* blocking Razorpay retries
-      await logRef.set({
-        ts: Timestamp.now(),
-        evtType,
-        raw: event,
-        error: e.message || "unknown",
-        processed: false,
-      });
-
-      // still HTTP-200 to avoid duplicate automatic retries – we track retry need via processed:false
+      console.error("Webhook error:", e);
+      await logRef.set({ ts: Timestamp.now(), evt, raw: event, error: e.message, processed: false });
     }
-
-    return res.status(200).send("ok");
+    res.status(200).send("ok");
   }
 );
 
-// After webhook route:
+/* body-parser AFTER webhook */
 app.use(express.json({ limit: "1mb" }));
 
-/* =========================
-   Helpers
-========================= */
+/* ╔═══════════════════════════════════════════════════════╗
+   ║                     HELPERS                           ║
+   ╚═══════════════════════════════════════════════════════╝ */
+
 async function getCompanyIdForUser(userId) {
-  const s = await db.collection("users").doc(userId).get();
-  if (!s.exists) throw Object.assign(new Error("User not found"), { code: 404 });
-  const d = s.data();
-  if (!d?.companyId)
-    throw Object.assign(new Error("User has no company linked"), { code: 404 });
-  return d.companyId;
+  const snap = await db.collection("users").doc(userId).get();
+  if (!snap.exists) throw Object.assign(new Error("User not found"), { code: 404 });
+  const companyId = snap.data()?.companyId;
+  if (!companyId)   throw Object.assign(new Error("No company linked"), { code: 404 });
+  return companyId;
 }
 
-// In-memory created plan cache (for when env IDs are missing)
 const planCache = new Map();
-
 async function getOrCreateRazorpayPlan(planKey) {
   const cfg = PLAN_CATALOG[planKey];
   if (!cfg) throw Object.assign(new Error("Unknown planKey"), { code: 400 });
 
-  // Env override
-  const envId = process.env[cfg.envKey];
-  if (envId) return envId;
+  /* environment override */
+  if (process.env[cfg.envKey]) return process.env[cfg.envKey];
+  if (planCache.has(planKey))  return planCache.get(planKey);
 
-  if (planCache.has(planKey)) return planCache.get(planKey);
+  /* create on-the-fly */
+  const descMap = {
+    starter: "Up to 3 000 messages / month",
+    growth:  "Up to 15 000 messages / month",
+    scale:   "Up to 50 000 messages / month",
+  };
 
-  // Create a plan on the fly (visible in Razorpay dashboard)
-  const period = cfg.period === "yearly" ? "year" : "month";
   const plan = await razorpay.plans.create({
-    period, // "month" | "year"
+    period:   cfg.period === "yearly" ? "year" : "month",
     interval: cfg.interval,
     item: {
-      name: cfg.name,
-      amount: cfg.amountPaise,
-      currency: "INR",
-      description:
-        cfg.tier === "pro"
-          ? "Up to 3,000 messages / month"
-          : "Up to 15,000 messages / month",
+      name:        cfg.name,
+      amount:      cfg.amountPaise,
+      currency:    "INR",
+      description: descMap[cfg.tier] || "Botify subscription",
     },
     notes: { planKey },
   });
 
   planCache.set(planKey, plan.id);
-  console.log(`🆕 Created Razorpay plan ${planKey} -> ${plan.id}`);
+  console.log(`🆕 Razorpay plan created: ${planKey} → ${plan.id}`);
   return plan.id;
 }
 
-/* =========================
-   Public: status & ping
-========================= */
-app.get("/", (req, res) => {
-  res.send("✅ Botify backend running (autopay + yearly enabled).");
-});
+/* ╔═══════════════════════════════════════════════════════╗
+   ║              PUBLIC  STATUS  ENDPOINTS                ║
+   ╚═══════════════════════════════════════════════════════╝ */
 
-/* Billing catalogue for frontend */
-const toRs = (paise) => Math.round(paise / 100); // 649900 → 6499
+app.get("/", (_req, res) => res.send("✅ Botify backend running."));
 
 app.get("/api/billing/plans", (_req, res) => {
+  const toRs = (p) => Math.round(p / 100);
   res.json({
     currency: "INR",
-    pro: {
+
+    starter: {
       monthly: {
-        price: toRs(PLAN_CATALOG.pro_monthly.amountPaise),
-        messages: 3000,
-        planKey: "pro_monthly",
+        price:    toRs(PLAN_CATALOG.starter_monthly.amountPaise),
+        messages: 3_000,
+        planKey:  "starter_monthly",
       },
       yearly: {
-        price: toRs(PLAN_CATALOG.pro_yearly.amountPaise),
-        messages: 3000,
-        planKey: "pro_yearly",
+        price:    toRs(PLAN_CATALOG.starter_yearly.amountPaise),
+        messages: 3_000,
+        planKey:  "starter_yearly",
       },
     },
-    proMax: {
+
+    growth: {
       monthly: {
-        price: toRs(PLAN_CATALOG.promax_monthly.amountPaise),
-        messages: 15000,
-        planKey: "promax_monthly",
+        price:    toRs(PLAN_CATALOG.growth_monthly.amountPaise),
+        messages: 15_000,
+        planKey:  "growth_monthly",
       },
       yearly: {
-        price: toRs(PLAN_CATALOG.promax_yearly.amountPaise),
-        messages: 15000,
-        planKey: "promax_yearly",
+        price:    toRs(PLAN_CATALOG.growth_yearly.amountPaise),
+        messages: 15_000,
+        planKey:  "growth_yearly",
       },
     },
+
+    scale: {
+      monthly: {
+        price:    toRs(PLAN_CATALOG.scale_monthly.amountPaise),
+        messages: 50_000,
+        planKey:  "scale_monthly",
+      },
+      yearly: {
+        price:    toRs(PLAN_CATALOG.scale_yearly.amountPaise),
+        messages: 50_000,
+        planKey:  "scale_yearly",
+      },
+    },
+
     overage: { per_1k: toRs(PLAN_CATALOG.overage_1k.amountPaise) },
   });
+});
+
+/* ╔═══════════════════════════════════════════════════════╗
+   ║               SUBSCRIPTION  HANDLERS                  ║
+   ╚═══════════════════════════════════════════════════════╝ */
+
+app.post("/api/billing/subscribe", async (req, res) => {
+  try {
+    const { planKey, userId, companyId, customer } = req.body;
+    if (!planKey) return res.status(400).json({ error: "Missing planKey" });
+
+    const planId         = await getOrCreateRazorpayPlan(planKey);
+    const targetCompanyId= companyId || (userId ? await getCompanyIdForUser(userId) : null);
+    if (!targetCompanyId) return res.status(400).json({ error: "Missing companyId" });
+
+    /* create (or reuse) customer */
+    let customerId = null;
+    if (customer?.email) {
+      try {
+        const c = await razorpay.customers.create({
+          name:    customer.name || "Botify User",
+          email:   customer.email,
+          contact: customer.contact || undefined,
+          notes:   { companyId: targetCompanyId, userId: userId || "" },
+        });
+        customerId = c.id;
+      } catch { /* optional */ }
+    }
+
+    const MAX_YEARS = 100;
+    const cycles    = planKey.includes("yearly") ? MAX_YEARS : MAX_YEARS * 12;
+
+    const sub = await razorpay.subscriptions.create({
+      plan_id:         planId,
+      total_count:     cycles,
+      customer_notify: 1,
+      customer_id:     customerId || undefined,
+      notes: { planKey, companyId: targetCompanyId, userId: userId || "" },
+    });
+
+    /* store shell */
+    await db.collection("companies").doc(targetCompanyId).set({
+      subscriptionId:     sub.id,
+      subscriptionStatus: sub.status,
+      tier:               PLAN_CATALOG[planKey].tier,
+      billingInterval:    planKey.includes("yearly") ? "yearly" : "monthly",
+      currentPeriodEnd:   sub.current_end ? Timestamp.fromDate(new Date(sub.current_end * 1_000)) : null,
+    }, { merge: true });
+
+    res.json({
+      subscriptionId: sub.id,
+      shortKey:       planKey,
+      status:         sub.status,
+      checkout: {
+        key:             keyId,
+        subscription_id: sub.id,
+        customer_id:     customerId,
+        name:            "Botify",
+        description:     PLAN_CATALOG[planKey].name,
+        notes:           { planKey, companyId: targetCompanyId },
+      },
+    });
+  } catch (e) {
+    console.error("subscribe error:", e);
+    res.status(500).json({ error: e?.error?.description || e.message || "Subscribe failed" });
+  }
+});
+
+/* add-on 1 000 messages */
+app.post("/api/billing/buy-overage", async (req, res) => {
+  const { userId, blocks = 1 } = req.body;
+  if (!userId) return res.status(400).json({ error: "Missing userId" });
+  if (blocks < 1 || blocks > 20) return res.status(400).json({ error: "Invalid blocks" });
+
+  try {
+    const companyId = await getCompanyIdForUser(userId);
+    const snap      = await db.collection("companies").doc(companyId).get();
+    const subId     = snap.data()?.subscriptionId;
+    if (!subId) return res.status(400).json({ error: "No active subscription" });
+
+    const addon = await razorpay.addons.create({
+      subscription_id: subId,
+      item: {
+        name:     `Pre-paid ${blocks * 1_000} messages`,
+        amount:   PLAN_CATALOG.overage_1k.amountPaise * blocks,
+        currency: "INR",
+      },
+      quantity: 1,
+    });
+
+    await snap.ref.update({ isOverageBilled: true });
+    res.json({ ok: true, addonId: addon.id });
+  } catch (e) {
+    console.error("buy-overage error:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 /* ===========================================================
