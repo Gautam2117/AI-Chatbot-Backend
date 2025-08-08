@@ -32,20 +32,17 @@ const WHITELIST = [
 
 app.use(
   cors({
-    origin:        true,
-    methods:       ["GET", "POST"],
-    allowedHeaders:["Content-Type", "x-user-id"],
-    credentials:   true,
-    origin:        (o, cb) => cb(null, WHITELIST.includes(o) || !o),
-    credentials:   true,
-    methods:       ["GET", "POST", "OPTIONS"],
-    allowedHeaders:["Content-Type", "x-user-id"],
-    optionsSuccessStatus: 204,    
+    origin:            (o, cb) => cb(null, WHITELIST.includes(o) || !o),
+    credentials:       true,
+    methods:           ["GET", "POST", "OPTIONS"],
+    allowedHeaders:    ["Content-Type", "x-user-id"],
+    optionsSuccessStatus: 204,        
   })
 );
 
 /** IMPORTANT: make Express answer the pre-flight before any route */
-app.options("*", cors());
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));  
 
 app.use(helmet());
 
