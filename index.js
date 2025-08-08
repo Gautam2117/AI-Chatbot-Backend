@@ -294,30 +294,30 @@ async function getCompanyIdForUser(userId) {
 }
 
 const planCache = new Map();
-async function getOrCreateRazorpayPlan(planKey) {
+
+async function getOrCreateRazorpayPlan (planKey) {
   const cfg = PLAN_CATALOG[planKey];
   if (!cfg) throw Object.assign(new Error("Unknown planKey"), { code: 400 });
 
-  /* environment override */
+  /* Use cached / env-provided ID if available */
   if (process.env[cfg.envKey]) return process.env[cfg.envKey];
   if (planCache.has(planKey))  return planCache.get(planKey);
 
-  /* create on-the-fly */
-  const descMap = {
-    starter: "Up to 3 000 messages / month",
-    growth:  "Up to 15 000 messages / month",
-    scale:   "Up to 50 000 messages / month",
-  };
+  /* Convert our “monthly | yearly” → Razorpay “month | year” */
+  const razorPeriod = cfg.period === "yearly" ? "year" : "month";
 
   const plan = await razorpay.plans.create({
-    period:   cfg.period, // "monthly" or "yearly",
+    period:   razorPeriod,          // ← valid value
     interval: cfg.interval,
-    // addon_applicable: 1,
     item: {
       name:        cfg.name,
       amount:      cfg.amountPaise,
       currency:    "INR",
-      description: descMap[cfg.tier] || "Botify subscription",
+      description: {
+        starter: "Up to 3 000 messages / month",
+        growth : "Up to 15 000 messages / month",
+        scale  : "Up to 50 000 messages / month",
+      }[cfg.tier] || "Botify subscription",
     },
     notes: { planKey },
   });
@@ -385,74 +385,74 @@ app.get("/api/billing/plans", (_req, res) => {
    ║               SUBSCRIPTION  HANDLERS                  ║
    ╚═══════════════════════════════════════════════════════╝ */
 
-app.post("/api/billing/subscribe", async (req, res) => {
-  const companySnap = await db.collection('companies').doc(targetCompanyId).get();
-  const existing = companySnap.data();
-  if (existing?.tier && existing?.billingInterval) {
-    const existingKey = `${existing.tier}_${existing.billingInterval}`;
-    if (existingKey === planKey)
-      return res.status(400).json({ error: 'Already on that plan' });
-  }
-  try {
-    const { planKey, userId, companyId, customer } = req.body;
-    if (!planKey) return res.status(400).json({ error: "Missing planKey" });
+// app.post("/api/billing/subscribe", async (req, res) => {
+//   const companySnap = await db.collection('companies').doc(targetCompanyId).get();
+//   const existing = companySnap.data();
+//   if (existing?.tier && existing?.billingInterval) {
+//     const existingKey = `${existing.tier}_${existing.billingInterval}`;
+//     if (existingKey === planKey)
+//       return res.status(400).json({ error: 'Already on that plan' });
+//   }
+//   try {
+//     const { planKey, userId, companyId, customer } = req.body;
+//     if (!planKey) return res.status(400).json({ error: "Missing planKey" });
 
-    const planId         = await getOrCreateRazorpayPlan(planKey);
-    const targetCompanyId= companyId || (userId ? await getCompanyIdForUser(userId) : null);
-    if (!targetCompanyId) return res.status(400).json({ error: "Missing companyId" });
+//     const planId         = await getOrCreateRazorpayPlan(planKey);
+//     const targetCompanyId= companyId || (userId ? await getCompanyIdForUser(userId) : null);
+//     if (!targetCompanyId) return res.status(400).json({ error: "Missing companyId" });
 
-    /* create (or reuse) customer */
-    let customerId = null;
-    if (customer?.email) {
-      try {
-        const c = await razorpay.customers.create({
-          name:    customer.name || "Botify User",
-          email:   customer.email,
-          contact: customer.contact || undefined,
-          notes:   { companyId: targetCompanyId, userId: userId || "" },
-        });
-        customerId = c.id;
-      } catch { /* optional */ }
-    }
+//     /* create (or reuse) customer */
+//     let customerId = null;
+//     if (customer?.email) {
+//       try {
+//         const c = await razorpay.customers.create({
+//           name:    customer.name || "Botify User",
+//           email:   customer.email,
+//           contact: customer.contact || undefined,
+//           notes:   { companyId: targetCompanyId, userId: userId || "" },
+//         });
+//         customerId = c.id;
+//       } catch { /* optional */ }
+//     }
 
-    const MAX_YEARS = 100;
-    const cycles    = planKey.includes("yearly") ? MAX_YEARS : MAX_YEARS * 12;
+//     const MAX_YEARS = 100;
+//     const cycles    = planKey.includes("yearly") ? MAX_YEARS : MAX_YEARS * 12;
 
-    const sub = await razorpay.subscriptions.create({
-      plan_id:         planId,
-      total_count:     cycles,
-      customer_notify: 1,
-      customer_id:     customerId || undefined,
-      notes: { planKey, companyId: targetCompanyId, userId: userId || "" },
-    });
+//     const sub = await razorpay.subscriptions.create({
+//       plan_id:         planId,
+//       total_count:     cycles,
+//       customer_notify: 1,
+//       customer_id:     customerId || undefined,
+//       notes: { planKey, companyId: targetCompanyId, userId: userId || "" },
+//     });
 
-    /* store shell */
-    await db.collection("companies").doc(targetCompanyId).set({
-      subscriptionId:     sub.id,
-      subscriptionStatus: sub.status,
-      tier:               PLAN_CATALOG[planKey].tier,
-      billingInterval:    planKey.includes("yearly") ? "yearly" : "monthly",
-      currentPeriodEnd:   sub.current_end ? Timestamp.fromDate(new Date(sub.current_end * 1_000)) : null,
-    }, { merge: true });
+//     /* store shell */
+//     await db.collection("companies").doc(targetCompanyId).set({
+//       subscriptionId:     sub.id,
+//       subscriptionStatus: sub.status,
+//       tier:               PLAN_CATALOG[planKey].tier,
+//       billingInterval:    planKey.includes("yearly") ? "yearly" : "monthly",
+//       currentPeriodEnd:   sub.current_end ? Timestamp.fromDate(new Date(sub.current_end * 1_000)) : null,
+//     }, { merge: true });
 
-    res.json({
-      subscriptionId: sub.id,
-      shortKey:       planKey,
-      status:         sub.status,
-      checkout: {
-        key:             keyId,
-        subscription_id: sub.id,
-        customer_id:     customerId,
-        name:            "Botify",
-        description:     PLAN_CATALOG[planKey].name,
-        notes:           { planKey, companyId: targetCompanyId },
-      },
-    });
-  } catch (e) {
-    console.error("subscribe error:", e);
-    res.status(500).json({ error: e?.error?.description || e.message || "Subscribe failed" });
-  }
-});
+//     res.json({
+//       subscriptionId: sub.id,
+//       shortKey:       planKey,
+//       status:         sub.status,
+//       checkout: {
+//         key:             keyId,
+//         subscription_id: sub.id,
+//         customer_id:     customerId,
+//         name:            "Botify",
+//         description:     PLAN_CATALOG[planKey].name,
+//         notes:           { planKey, companyId: targetCompanyId },
+//       },
+//     });
+//   } catch (e) {
+//     console.error("subscribe error:", e);
+//     res.status(500).json({ error: e?.error?.description || e.message || "Subscribe failed" });
+//   }
+// });
 
 // /* add-on 1 000 messages */
 // app.post("/api/billing/buy-overage", async (req, res) => {
@@ -490,31 +490,38 @@ app.post("/api/billing/subscribe", async (req, res) => {
     const { planKey, userId, companyId, customer } = req.body;
     if (!planKey) return res.status(400).json({ error: "Missing planKey" });
 
-    /* 1️⃣  Make / find the Razorpay plan */
-    const planId = await getOrCreateRazorpayPlan(planKey);
-
-    /* 2️⃣  Resolve the company we are billing  (⬅️ this was missing) */
+    /* 1️⃣  Resolve company */
     const targetCompanyId =
       companyId || (userId ? await getCompanyIdForUser(userId) : null);
     if (!targetCompanyId)
       return res.status(400).json({ error: "Missing companyId" });
 
-    /* 3️⃣  (optional) Create / reuse Razorpay customer for nicer invoices */
+    /* 2️⃣  Reject if already on that exact plan */
+    const cSnap     = await db.collection("companies").doc(targetCompanyId).get();
+    const existing  = cSnap.data() || {};
+    const currentKey = `${(existing.tier || "free")}_${existing.billingInterval || "monthly"}`;
+    if (currentKey === planKey)
+      return res.status(400).json({ error: "Already on that plan" });
+
+    /* 3️⃣  Ensure Razorpay plan exists */
+    const planId = await getOrCreateRazorpayPlan(planKey);
+
+    /* 4️⃣  (optional) Create / reuse Razorpay customer */
     let customerId = null;
     if (customer?.email) {
       try {
         const c = await razorpay.customers.create({
-          name:    customer.name   || "Botify User",
+          name:    customer.name || "Botify User",
           email:   customer.email,
           contact: customer.contact || undefined,
           notes:   { companyId: targetCompanyId, userId: userId || "" },
         });
         customerId = c.id;
-      } catch {/* customer is optional */}
+      } catch { /* customer creation is best-effort */ }
     }
 
-    /* 4️⃣  Create subscription (auto-renew until cancelled) */
-    const cycles = planKey.includes("yearly") ? 100 /* yrs */ : 1200 /* mos */;
+    /* 5️⃣  Create the subscription (auto-renew) */
+    const cycles = planKey.includes("yearly") ? 100 /* years */ : 1200 /* months */;
     const sub    = await razorpay.subscriptions.create({
       plan_id:         planId,
       total_count:     cycles,
@@ -523,7 +530,7 @@ app.post("/api/billing/subscribe", async (req, res) => {
       notes:           { planKey, companyId: targetCompanyId, userId: userId || "" },
     });
 
-    /* 5️⃣  Persist a shell of the subscription in Firestore */
+    /* 6️⃣  Persist shell in Firestore */
     await db.collection("companies").doc(targetCompanyId).set({
       subscriptionId:     sub.id,
       subscriptionStatus: sub.status,
@@ -534,7 +541,7 @@ app.post("/api/billing/subscribe", async (req, res) => {
                            : null,
     }, { merge: true });
 
-    /* 6️⃣  Return checkout payload for Razorpay modal */
+    /* 7️⃣  Return checkout payload */
     return res.json({
       subscriptionId: sub.id,
       shortKey:       planKey,
@@ -822,7 +829,7 @@ app.post("/api/chat", async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
 
   let replyText = "";
-  const promptTokens = estimateTokenCount(prompt); // legacy metric
+  const promptTokens = estTokens(prompt); // legacy metric
 
   try {
     /* ──────────────── 1. Call DeepSeek in streaming mode ──────────────── */
@@ -852,7 +859,7 @@ app.post("/api/chat", async (req, res) => {
     ---------------------------------------------------------------- */
     const approxTokens =
       promptTokens +                       // prompt that we sent
-      estimateTokenCount(replyText);       // assistant response size
+      estTokens(replyText);       // assistant response size
 
     db.collection("companies")
       .doc(companyId)
