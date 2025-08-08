@@ -454,118 +454,106 @@ app.post("/api/billing/subscribe", async (req, res) => {
   }
 });
 
-/* add-on 1 000 messages */
-app.post("/api/billing/buy-overage", async (req, res) => {
-  const { userId, blocks = 1 } = req.body;
-  if (!userId) return res.status(400).json({ error: "Missing userId" });
-  if (blocks < 1 || blocks > 20) return res.status(400).json({ error: "Invalid blocks" });
+// /* add-on 1 000 messages */
+// app.post("/api/billing/buy-overage", async (req, res) => {
+//   const { userId, blocks = 1 } = req.body;
+//   if (!userId) return res.status(400).json({ error: "Missing userId" });
+//   if (blocks < 1 || blocks > 20) return res.status(400).json({ error: "Invalid blocks" });
 
-  try {
-    const companyId = await getCompanyIdForUser(userId);
-    const snap      = await db.collection("companies").doc(companyId).get();
-    const subId     = snap.data()?.subscriptionId;
-    if (!subId) return res.status(400).json({ error: "No active subscription" });
+//   try {
+//     const companyId = await getCompanyIdForUser(userId);
+//     const snap      = await db.collection("companies").doc(companyId).get();
+//     const subId     = snap.data()?.subscriptionId;
+//     if (!subId) return res.status(400).json({ error: "No active subscription" });
 
-    const addon = await razorpay.addons.create({
-      subscription_id: subId,
-      item: {
-        name:     `Pre-paid ${blocks * 1_000} messages`,
-        amount:   PLAN_CATALOG.overage_1k.amountPaise * blocks,
-        currency: "INR",
-      },
-      quantity: 1,
-    });
+//     const addon = await razorpay.addons.create({
+//       subscription_id: subId,
+//       item: {
+//         name:     `Pre-paid ${blocks * 1_000} messages`,
+//         amount:   PLAN_CATALOG.overage_1k.amountPaise * blocks,
+//         currency: "INR",
+//       },
+//       quantity: 1,
+//     });
 
-    await snap.ref.update({ isOverageBilled: true });
-    res.json({ ok: true, addonId: addon.id });
-  } catch (e) {
-    console.error("buy-overage error:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
+//     await snap.ref.update({ isOverageBilled: true });
+//     res.json({ ok: true, addonId: addon.id });
+//   } catch (e) {
+//     console.error("buy-overage error:", e);
+//     res.status(500).json({ error: e.message });
+//   }
+// });
 
-/* ===========================================================
-   Billing: create a subscription (autopay)
-   Frontend opens Razorpay Checkout with subscription_id
-=========================================================== */
+/* ─────────────────────────  SUBSCRIPTION  HANDLER  ───────────────────────── */
 app.post("/api/billing/subscribe", async (req, res) => {
   try {
     const { planKey, userId, companyId, customer } = req.body;
     if (!planKey) return res.status(400).json({ error: "Missing planKey" });
+
+    /* 1️⃣  Make / find the Razorpay plan */
     const planId = await getOrCreateRazorpayPlan(planKey);
 
+    /* 2️⃣  Resolve the company we are billing  (⬅️ this was missing) */
     const targetCompanyId =
       companyId || (userId ? await getCompanyIdForUser(userId) : null);
-    if (!targetCompanyId) return res.status(400).json({ error: "Missing companyId" });
+    if (!targetCompanyId)
+      return res.status(400).json({ error: "Missing companyId" });
 
-    // Create (or reuse) a Razorpay customer (optional but nice for invoices)
+    /* 3️⃣  (optional) Create / reuse Razorpay customer for nicer invoices */
     let customerId = null;
     if (customer?.email) {
       try {
         const c = await razorpay.customers.create({
-          name: customer.name || "Botify User",
-          email: customer.email,
+          name:    customer.name   || "Botify User",
+          email:   customer.email,
           contact: customer.contact || undefined,
-          notes: { companyId: targetCompanyId, userId: userId || "" },
+          notes:   { companyId: targetCompanyId, userId: userId || "" },
         });
         customerId = c.id;
-      } catch {
-        // ignore — customer is optional
-      }
+      } catch {/* customer is optional */}
     }
 
-    const MAX_YEARS = 100;
-    const cycles =
-      planKey.includes('yearly') ? MAX_YEARS : MAX_YEARS * 12;
-
-    // NOTE: total_count — if omitted/0, Razorpay treats it as "auto-renew till cancelled".
-    const sub = await razorpay.subscriptions.create({
-      plan_id: planId,
-      total_count: cycles,
+    /* 4️⃣  Create subscription (auto-renew until cancelled) */
+    const cycles = planKey.includes("yearly") ? 100 /* yrs */ : 1200 /* mos */;
+    const sub    = await razorpay.subscriptions.create({
+      plan_id:         planId,
+      total_count:     cycles,
       customer_notify: 1,
-      customer_id: customerId || undefined,
-      notes: { planKey, companyId: targetCompanyId, userId: userId || "" },
+      customer_id:     customerId || undefined,
+      notes:           { planKey, companyId: targetCompanyId, userId: userId || "" },
     });
 
-    // Store subscription shell immediately
-    await db.collection("companies").doc(targetCompanyId).set(
-      {
-        subscriptionId: sub.id,
-        subscriptionStatus: sub.status,
-        tier: PLAN_CATALOG[planKey].tier,
-        billingInterval: planKey.includes("yearly") ? "yearly" : "monthly",
-        currentPeriodEnd: sub.current_end
-          ? Timestamp.fromDate(new Date(sub.current_end * 1000))
-          : null,
-      },
-      { merge: true }
-    );
+    /* 5️⃣  Persist a shell of the subscription in Firestore */
+    await db.collection("companies").doc(targetCompanyId).set({
+      subscriptionId:     sub.id,
+      subscriptionStatus: sub.status,
+      tier:               PLAN_CATALOG[planKey].tier,
+      billingInterval:    planKey.includes("yearly") ? "yearly" : "monthly",
+      currentPeriodEnd:   sub.current_end
+                           ? Timestamp.fromDate(new Date(sub.current_end * 1_000))
+                           : null,
+    }, { merge: true });
 
-    res.json({
+    /* 6️⃣  Return checkout payload for Razorpay modal */
+    return res.json({
       subscriptionId: sub.id,
-      shortKey: planKey,
-      status: sub.status,
-      // Razorpay Checkout options you might want on the FE:
+      shortKey:       planKey,
+      status:         sub.status,
       checkout: {
-        key: process.env.RAZORPAY_KEY_ID,
+        key:             process.env.RAZORPAY_KEY_ID,
         subscription_id: sub.id,
-        customer_id: customerId,
-        name: "Botify",
-        description: PLAN_CATALOG[planKey].name,
-        notes: { planKey, companyId: targetCompanyId },
+        customer_id:     customerId,
+        name:            "Botify",
+        description:     PLAN_CATALOG[planKey].name,
+        notes:           { planKey, companyId: targetCompanyId },
       },
     });
   } catch (e) {
-    console.error("subscribe error", e);          // still in logs
-
-    /* Bubble a safe message back so the FE can show it */
-    const msg =
-      e?.error?.description        // Razorpay REST errors
-    || e?.message                  // ordinary JS Error
-    || "Unknown subscribe error";
-
-    res.status(500).json({ error: msg });
-    }
+    console.error("subscribe error:", e);
+    return res.status(500).json({
+      error: e?.error?.description || e.message || "Subscribe failed",
+    });
+  }
 });
 
 /* ===========================================================
