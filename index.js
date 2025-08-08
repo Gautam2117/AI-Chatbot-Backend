@@ -40,8 +40,7 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
-app.use(cors(corsOptions));            // attach CORS headers
-app.options("*", cors(corsOptions));   // answer every pre-flight
+app.use(cors(corsOptions));  // attach CORS headers
 app.use(helmet());
 
 /* ──────────────────────────────────
