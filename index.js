@@ -187,93 +187,122 @@ async function nightlyOverageJob() {
 
 app.post(
   "/api/razorpay-webhook",
-  express.raw({ type: "application/json" }),            // keep raw body
+  express.raw({ type: "application/json" }), // keep raw body for signature check
   async (req, res) => {
     const sigHdr = req.headers["x-razorpay-signature"];
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
     if (!sigHdr || !secret) return res.status(400).send("Missing signature/secret");
 
-    /* verify HMAC */
+    // 1️⃣ Verify HMAC signature
     let raw;
-    try { raw = req.body.toString("utf8"); }
-    catch { return res.status(400).send("Bad raw body"); }
-
+    try {
+      raw = req.body.toString("utf8");
+    } catch {
+      return res.status(400).send("Bad raw body");
+    }
     const expected = crypto.createHmac("sha256", secret).update(raw).digest("hex");
-    if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sigHdr)))
+    if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sigHdr))) {
       return res.status(400).send("Invalid signature");
+    }
 
+    // 2️⃣ Parse event
     let event;
-    try { event = JSON.parse(raw); }
-    catch { return res.status(400).send("Bad JSON"); }
+    try {
+      event = JSON.parse(raw);
+    } catch {
+      return res.status(400).send("Bad JSON");
+    }
+    const evt = event.event;
 
-    const evt   = event?.event;
-    const dedup = event?.payload?.subscription?.entity?.id
-               || event?.payload?.invoice?.entity?.id
-               || event?.payload?.payment?.entity?.id
-               || `${evt}:${event?.created_at}`;
-
-    const logRef = db.collection("webhookLogs").doc(dedup);
-    if ((await logRef.get()).data()?.processed) return res.status(200).end("dup");
+    // 3️⃣ Dedupe
+    const dedupId =
+      event.payload.subscription?.entity?.id ||
+      event.payload.invoice?.entity?.id ||
+      event.payload.payment?.entity?.id ||
+      `${evt}:${event.created_at}`;
+    const logRef = db.collection("webhookLogs").doc(dedupId);
+    const prev = await logRef.get();
+    if (prev.exists && prev.data().processed) {
+      return res.status(200).send("dup");
+    }
 
     try {
-      /* subscription.* */
-      if (evt?.startsWith("subscription.")) {
-        const sub   = event.payload.subscription.entity;
-        const notes = sub.notes || {};
-        const companyId = notes.companyId || (await getCompanyIdForUser(notes.userId).catch(() => null));
-        if (companyId) {
-          await db.collection("companies").doc(companyId).set({
-            subscriptionId:     sub.id,
-            subscriptionStatus: sub.status,
-            tier:               PLAN_CATALOG[notes.planKey]?.tier || "starter",
-            billingInterval:    notes.planKey?.includes("yearly") ? "yearly" : "monthly",
-            currentPeriodEnd:   sub.current_end ? Timestamp.fromDate(new Date(sub.current_end * 1_000)) : null,
-            messagesUsedMonth:  0,
-            lastMsgAt:          Timestamp.now(),
-          }, { merge: true });
-          console.log(`✅ Webhook: ${companyId} set to ${sub.status}`);
-        }
-      }
+      // ─── When an invoice is paid, activate and set the tier ───
+      if (evt === "invoice.paid") {
+        const inv     = event.payload.invoice.entity;
+        const subId   = inv.subscription_id;
+        const notes   = inv.notes || {};
+        const planKey = notes.planKey;
+        const tier    = PLAN_CATALOG[planKey]?.tier || "starter";
+        const interval = planKey.includes("yearly") ? "yearly" : "monthly";
+        const nextAttempt = inv.next_payment_attempt;
+        const endTs   = nextAttempt
+          ? Timestamp.fromDate(new Date(nextAttempt * 1000))
+          : null;
 
-      /* invoice.paid */
-      else if (evt === "invoice.paid") {
-        const inv   = event.payload.invoice.entity;
-        const subId = inv.subscription_id;
-        if (subId) {
-          const comp = await db.collection("companies").where("subscriptionId", "==", subId).limit(1).get();
-          if (!comp.empty) {
-            const ref = comp.docs[0].ref;
-            let endTs = null;
-            try {
-              const s = await razorpay.subscriptions.fetch(subId);
-              if (s?.current_end) endTs = Timestamp.fromDate(new Date(s.current_end * 1_000));
-            } catch {}
-            await ref.set({
+        // find the company
+        const compSnap = await db
+          .collection("companies")
+          .where("subscriptionId", "==", subId)
+          .limit(1)
+          .get();
+
+        if (!compSnap.empty) {
+          await compSnap.docs[0].ref.set(
+            {
+              subscriptionStatus: "active",
+              tier,
+              billingInterval: interval,
+              currentPeriodEnd: endTs,
               messagesUsedMonth: 0,
-              currentPeriodEnd:  endTs || FieldValue.delete(),
-              subscriptionStatus:"active",
-              isOverageBilled:   false,
-            }, { merge: true });
-          }
+              isOverageBilled: false,
+            },
+            { merge: true }
+          );
+          console.log(`✅ Webhook: company ${compSnap.docs[0].id} is now active`);
         }
       }
 
-      /* payment.failed */
+      // ─── When a payment fails, mark past_due ───
       else if (evt === "payment.failed") {
         const pay   = event.payload.payment.entity;
         const subId = pay.subscription_id;
-        if (subId) {
-          const comp = await db.collection("companies").where("subscriptionId", "==", subId).limit(1).get();
-          if (!comp.empty)
-            await comp.docs[0].ref.set({ subscriptionStatus: "past_due" }, { merge: true });
+
+        const compSnap = await db
+          .collection("companies")
+          .where("subscriptionId", "==", subId)
+          .limit(1)
+          .get();
+
+        if (!compSnap.empty) {
+          await compSnap.docs[0].ref.set(
+            { subscriptionStatus: "past_due" },
+            { merge: true }
+          );
+          console.log(
+            `⚠️  Webhook: company ${compSnap.docs[0].id} payment failed`
+          );
         }
       }
 
-      await logRef.set({ ts: Timestamp.now(), evt, raw: event, processed: true });
-    } catch (e) {
-      console.error("Webhook error:", e);
-      await logRef.set({ ts: Timestamp.now(), evt, raw: event, error: e.message, processed: false });
+      // ─── Log as processed ───
+      await logRef.set({
+        ts: Timestamp.now(),
+        evt,
+        processed: true,
+        raw: event,
+      });
+    } catch (err) {
+      console.error("Webhook handler error:", err);
+      await logRef.set({
+        ts: Timestamp.now(),
+        evt,
+        error: err.message,
+        processed: false,
+        raw: event,
+      });
     }
+
     res.status(200).send("ok");
   }
 );
@@ -302,9 +331,6 @@ async function getOrCreateRazorpayPlan (planKey) {
   /* Use cached / env-provided ID if available */
   if (process.env[cfg.envKey]) return process.env[cfg.envKey];
   if (planCache.has(planKey))  return planCache.get(planKey);
-
-  /* Convert our “monthly | yearly” → Razorpay “month | year” */
-  const razorPeriod = cfg.period === "yearly" ? "year" : "month";
 
   const plan = await razorpay.plans.create({
     period:   cfg.period,
@@ -381,108 +407,6 @@ app.get("/api/billing/plans", (_req, res) => {
   });
 });
 
-/* ╔═══════════════════════════════════════════════════════╗
-   ║               SUBSCRIPTION  HANDLERS                  ║
-   ╚═══════════════════════════════════════════════════════╝ */
-
-// app.post("/api/billing/subscribe", async (req, res) => {
-//   const companySnap = await db.collection('companies').doc(targetCompanyId).get();
-//   const existing = companySnap.data();
-//   if (existing?.tier && existing?.billingInterval) {
-//     const existingKey = `${existing.tier}_${existing.billingInterval}`;
-//     if (existingKey === planKey)
-//       return res.status(400).json({ error: 'Already on that plan' });
-//   }
-//   try {
-//     const { planKey, userId, companyId, customer } = req.body;
-//     if (!planKey) return res.status(400).json({ error: "Missing planKey" });
-
-//     const planId         = await getOrCreateRazorpayPlan(planKey);
-//     const targetCompanyId= companyId || (userId ? await getCompanyIdForUser(userId) : null);
-//     if (!targetCompanyId) return res.status(400).json({ error: "Missing companyId" });
-
-//     /* create (or reuse) customer */
-//     let customerId = null;
-//     if (customer?.email) {
-//       try {
-//         const c = await razorpay.customers.create({
-//           name:    customer.name || "Botify User",
-//           email:   customer.email,
-//           contact: customer.contact || undefined,
-//           notes:   { companyId: targetCompanyId, userId: userId || "" },
-//         });
-//         customerId = c.id;
-//       } catch { /* optional */ }
-//     }
-
-//     const MAX_YEARS = 100;
-//     const cycles    = planKey.includes("yearly") ? MAX_YEARS : MAX_YEARS * 12;
-
-//     const sub = await razorpay.subscriptions.create({
-//       plan_id:         planId,
-//       total_count:     cycles,
-//       customer_notify: 1,
-//       customer_id:     customerId || undefined,
-//       notes: { planKey, companyId: targetCompanyId, userId: userId || "" },
-//     });
-
-//     /* store shell */
-//     await db.collection("companies").doc(targetCompanyId).set({
-//       subscriptionId:     sub.id,
-//       subscriptionStatus: sub.status,
-//       tier:               PLAN_CATALOG[planKey].tier,
-//       billingInterval:    planKey.includes("yearly") ? "yearly" : "monthly",
-//       currentPeriodEnd:   sub.current_end ? Timestamp.fromDate(new Date(sub.current_end * 1_000)) : null,
-//     }, { merge: true });
-
-//     res.json({
-//       subscriptionId: sub.id,
-//       shortKey:       planKey,
-//       status:         sub.status,
-//       checkout: {
-//         key:             keyId,
-//         subscription_id: sub.id,
-//         customer_id:     customerId,
-//         name:            "Botify",
-//         description:     PLAN_CATALOG[planKey].name,
-//         notes:           { planKey, companyId: targetCompanyId },
-//       },
-//     });
-//   } catch (e) {
-//     console.error("subscribe error:", e);
-//     res.status(500).json({ error: e?.error?.description || e.message || "Subscribe failed" });
-//   }
-// });
-
-// /* add-on 1 000 messages */
-// app.post("/api/billing/buy-overage", async (req, res) => {
-//   const { userId, blocks = 1 } = req.body;
-//   if (!userId) return res.status(400).json({ error: "Missing userId" });
-//   if (blocks < 1 || blocks > 20) return res.status(400).json({ error: "Invalid blocks" });
-
-//   try {
-//     const companyId = await getCompanyIdForUser(userId);
-//     const snap      = await db.collection("companies").doc(companyId).get();
-//     const subId     = snap.data()?.subscriptionId;
-//     if (!subId) return res.status(400).json({ error: "No active subscription" });
-
-//     const addon = await razorpay.addons.create({
-//       subscription_id: subId,
-//       item: {
-//         name:     `Pre-paid ${blocks * 1_000} messages`,
-//         amount:   PLAN_CATALOG.overage_1k.amountPaise * blocks,
-//         currency: "INR",
-//       },
-//       quantity: 1,
-//     });
-
-//     await snap.ref.update({ isOverageBilled: true });
-//     res.json({ ok: true, addonId: addon.id });
-//   } catch (e) {
-//     console.error("buy-overage error:", e);
-//     res.status(500).json({ error: e.message });
-//   }
-// });
 
 /* ─────────────────────────  SUBSCRIPTION  HANDLER  ───────────────────────── */
 app.post("/api/billing/subscribe", async (req, res) => {
@@ -534,11 +458,8 @@ app.post("/api/billing/subscribe", async (req, res) => {
     await db.collection("companies").doc(targetCompanyId).set({
       subscriptionId:     sub.id,
       subscriptionStatus: sub.status,
-      tier:               PLAN_CATALOG[planKey].tier,
-      billingInterval:    planKey.includes("yearly") ? "yearly" : "monthly",
-      currentPeriodEnd:   sub.current_end
-                           ? Timestamp.fromDate(new Date(sub.current_end * 1_000))
-                           : null,
+      billingInterval: planKey.includes("yearly") ? "yearly" : "monthly",
+      currentPeriodEnd: null,
     }, { merge: true });
 
     /* 7️⃣  Return checkout payload */
@@ -567,8 +488,6 @@ app.post("/api/billing/subscribe", async (req, res) => {
    One-click add-on: 1 000 extra messages
 =========================================================== */
 app.post("/api/billing/buy-overage", async (req, res) => {
-  if (!subId) return res.status(400).json({ error: "No active subscription" });
-
   const { userId, blocks = 1 } = req.body;           // blocks → 1 k chunks
   if (!userId)           return res.status(400).json({ error: "Missing userId" });
   if (blocks < 1 || blocks > 20)
@@ -593,8 +512,11 @@ app.post("/api/billing/buy-overage", async (req, res) => {
     await snap.ref.update({ isOverageBilled: true });
     return res.json({ ok: true, addonId: addon.id });
   } catch (e) {
-    console.error("buy-overage error", e);
-    return res.status(500).json({ error: e.message });
+    const msg =
+      e?.error?.description?.includes("cannot add addon to a subscription in created state")
+        ? "Subscription not active yet – pay the first invoice and try again."
+        : e?.error?.description || e.message;
+    return res.status(400).json({ error: msg });
   }
 });
 
@@ -740,8 +662,10 @@ app.post("/api/chat", async (req, res) => {
 
     // soft-downgrade if subscription is paused / halted
     const tierRaw = c.tier || "free";
-    const tier    =
-      ["halted", "paused"].includes(c.subscriptionStatus) ? "free" : tierRaw;
+    const tier =
+      ["halted", "paused", "created"].includes(c.subscriptionStatus)
+        ? "free"
+        : tierRaw;
 
     const monthlyLimit = MESSAGE_LIMITS[tier] ?? 150;
     let   used         = c.messagesUsedMonth || 0;
@@ -919,10 +843,6 @@ app.get("/api/usage-status", async (req, res) => {
   });
 });
 
-/* ===========================================================
-   Legacy one-time order endpoints (kept for compatibility)
-   — You can remove later. Prefer /api/billing/subscribe.
-=========================================================== */
 app.post("/api/create-order", async (req, res) => {
   return res.status(410).json({
     error:
