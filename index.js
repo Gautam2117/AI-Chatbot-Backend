@@ -310,7 +310,7 @@ async function getOrCreateRazorpayPlan(planKey) {
   };
 
   const plan = await razorpay.plans.create({
-    period:   cfg.period === "yearly" ? "year" : "month",
+    period:   cfg.period, // "monthly" or "yearly",
     interval: cfg.interval,
     // addon_applicable: 1,
     item: {
@@ -386,6 +386,13 @@ app.get("/api/billing/plans", (_req, res) => {
    ╚═══════════════════════════════════════════════════════╝ */
 
 app.post("/api/billing/subscribe", async (req, res) => {
+  const companySnap = await db.collection('companies').doc(targetCompanyId).get();
+  const existing = companySnap.data();
+  if (existing?.tier && existing?.billingInterval) {
+    const existingKey = `${existing.tier}_${existing.billingInterval}`;
+    if (existingKey === planKey)
+      return res.status(400).json({ error: 'Already on that plan' });
+  }
   try {
     const { planKey, userId, companyId, customer } = req.body;
     if (!planKey) return res.status(400).json({ error: "Missing planKey" });
