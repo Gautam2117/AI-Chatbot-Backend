@@ -926,37 +926,42 @@ app.post("/api/register-company", async (req, res) => {
   }
 });
 
-// create-order endpoint
+/* ===========================================================
+   One-off overage purchase → Razorpay Order (≤40-char receipt)
+=========================================================== */
 app.post("/api/billing/create-overage-order", async (req, res) => {
   const { userId, blocks = 1 } = req.body;
-  if (!userId) return res.status(400).json({ error: "Missing userId" });
-  if (blocks < 1 || blocks > 20)
-    return res.status(400).json({ error: "Invalid blocks (1–20)" });
 
-  // find company & ensure they have an *active* subscription
-  const userSnap = await db.collection("users").doc(userId).get();
-  const companyId = userSnap.data()?.companyId;
-  if (!companyId) return res.status(400).json({ error: "No company linked" });
+  if (!userId)                     return res.status(400).json({ error: "Missing userId" });
+  if (blocks < 1 || blocks > 20)   return res.status(400).json({ error: "Invalid blocks (1–20)" });
 
-  const compSnap = await db.collection("companies").doc(companyId).get();
-  const c = compSnap.data() || {};
-  if (c.subscriptionStatus !== "active")
-    return res.status(403).json({ error: "Subscription not active" });
-
-  // build a Razorpay Order
-  const amount = PLAN_CATALOG.overage_1k.amountPaise * blocks; // e.g. 32900 * blocks
   try {
+    /* 1️⃣  Resolve company and make sure the sub is active */
+    const userSnap   = await db.collection("users").doc(userId).get();
+    const companyId  = userSnap.data()?.companyId;
+    if (!companyId)  return res.status(400).json({ error: "No company linked" });
+
+    const compSnap   = await db.collection("companies").doc(companyId).get();
+    if (compSnap.data()?.subscriptionStatus !== "active")
+      return res.status(403).json({ error: "Subscription not active" });
+
+    /* 2️⃣  Build order */
+    const amount   = PLAN_CATALOG.overage_1k.amountPaise * blocks;        // e.g. 32 900 × blocks
+    const ts       = Date.now().toString().slice(-8);                     // last 8 digits
+    const receipt  = `ov_${companyId.slice(0,10)}_${ts}`.slice(0,40);     // ≤ 40 chars ✅
+
     const order = await razorpay.orders.create({
       amount,
-      currency: "INR",
-      receipt: `overage_${companyId}_${Date.now()}`,
-      notes: { companyId, blocks: blocks.toString() },
+      currency : "INR",
+      receipt,
+      notes    : { companyId, blocks: blocks.toString() },
     });
+
     return res.json({
-      orderId: order.id,
-      amount: order.amount,
+      orderId : order.id,
+      amount  : order.amount,
       currency: order.currency,
-      key: process.env.RAZORPAY_KEY_ID,
+      key     : process.env.RAZORPAY_KEY_ID,
     });
   } catch (e) {
     console.error("create-order error:", e);
