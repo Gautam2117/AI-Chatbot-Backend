@@ -312,7 +312,7 @@ async function getOrCreateRazorpayPlan(planKey) {
   const plan = await razorpay.plans.create({
     period:   cfg.period === "yearly" ? "year" : "month",
     interval: cfg.interval,
-    addon_applicable: 1,
+    // addon_applicable: 1,
     item: {
       name:        cfg.name,
       amount:      cfg.amountPaise,
