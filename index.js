@@ -307,7 +307,7 @@ async function getOrCreateRazorpayPlan (planKey) {
   const razorPeriod = cfg.period === "yearly" ? "year" : "month";
 
   const plan = await razorpay.plans.create({
-    period:   razorPeriod,          // ← valid value
+    period:   cfg.period,
     interval: cfg.interval,
     item: {
       name:        cfg.name,
@@ -567,6 +567,8 @@ app.post("/api/billing/subscribe", async (req, res) => {
    One-click add-on: 1 000 extra messages
 =========================================================== */
 app.post("/api/billing/buy-overage", async (req, res) => {
+  if (!subId) return res.status(400).json({ error: "No active subscription" });
+
   const { userId, blocks = 1 } = req.body;           // blocks → 1 k chunks
   if (!userId)           return res.status(400).json({ error: "Missing userId" });
   if (blocks < 1 || blocks > 20)
