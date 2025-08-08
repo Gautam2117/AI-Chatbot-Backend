@@ -3,6 +3,8 @@
 ----------------------------------------------------------------- */
 
 import "./dailyReset.js";
+import { dedupe } from "./utils/dedupe.js";
+
 import rateLimit          from "express-rate-limit";
 import helmet             from "helmet";
 import express            from "express";
@@ -15,6 +17,7 @@ import { Timestamp, FieldValue } from "firebase-admin/firestore";
 import { db }             from "./firebase.js";
 import stringSimilarity   from "string-similarity";
 import basicAuth          from "express-basic-auth";
+import natural from "natural";
 
 dotenv.config();
 
@@ -260,6 +263,21 @@ app.post(
             { merge: true }
           );
           console.log(`✅ Webhook: company ${compSnap.docs[0].id} is now active`);
+        }
+      }
+
+      // ─── credit overage when a one-time payment is captured ───
+      if (evt === "payment.captured") {
+        const pay = event.payload.payment.entity;
+        const notes = pay.notes || {};
+        if (notes.companyId && notes.blocks) {
+          const compRef = db.collection("companies").doc(notes.companyId);
+          await compRef.update({
+            overageCredits: FieldValue.increment(parseInt(notes.blocks) * 1000)
+          });
+          console.log(
+            `💰 Credited ${notes.blocks}k extra msgs to ${notes.companyId}`
+          );
         }
       }
 
@@ -630,68 +648,106 @@ app.use(
 app.post("/api/chat", async (req, res) => {
   console.log("📩 /api/chat");
 
-  /* ---------- time-box the whole request to 60 s ---------- */
+  /* ─── time‐box to 60s ────────────────────────────────────── */
   res.setTimeout(60_000, () => {
     try { res.write("\n[Error: timeout]"); } finally { res.end(); }
   });
 
-  /* ---------- validate input ---------- */
-  const userId   = req.headers["x-user-id"] || "test-user";
-  const qRaw     = typeof req.body.question === "string" ? req.body.question.trim() : "";
-  if (!qRaw)       return res.status(400).json({ error: "Missing or invalid question." });
-  if (qRaw.length > 2_000)
-    return res.status(400).json({ error: "Question too long (2 000 chars max)." });
-  if (qRaw.split(/\s+/).length < 4)
-    return res.status(400).json({ error: "Please ask a more specific question (≥ 4 words)." });
+  /* ─── validate input ────────────────────────────────────── */
+  const userId = req.headers["x-user-id"] || "test-user";
+  const qRaw = typeof req.body.question === "string"
+    ? req.body.question.trim()
+    : "";
+  if (!qRaw) {
+    return res.status(400).json({ error: "Missing or invalid question." });
+  }
+  if (qRaw.length > 2000) {
+    return res
+      .status(400)
+      .json({ error: "Question too long (2 000 chars max)." });
+  }
+  if (qRaw.split(/\s+/).length < 2) {
+    return res
+      .status(400)
+      .json({ error: "Please ask a more specific question." });
+  }
 
-  /* ---------- fetch user & company ---------- */
-  const userDoc = await db.collection("users").doc(userId).get();
-  if (!userDoc.exists)               return res.status(404).json({ error: "User not found." });
-  const companyId = userDoc.data()?.companyId;
-  if (!companyId)
-    return res.status(400).json({ error: "User not linked to a company." });
-
+  /* ─── fetch user & company ───────────────────────────────── */
+  const userSnap = await db.collection("users").doc(userId).get();
+  if (!userSnap.exists) {
+    return res.status(404).json({ error: "User not found." });
+  }
+  const companyId = userSnap.data()?.companyId;
+  if (!companyId) {
+    return res
+      .status(400)
+      .json({ error: "User not linked to a company." });
+  }
   const companyRef = db.collection("companies").doc(companyId);
   const companyDoc = await companyRef.get();
-  if (!companyDoc.exists)            return res.status(404).json({ error: "Company not found." });
+  if (!companyDoc.exists) {
+    return res.status(404).json({ error: "Company not found." });
+  }
 
-  /* ---------- quota — check & reserve atomically ---------- */
+  /* ─── quota + overage check & reserve atomically ──────────── */
   const reserveResult = await db.runTransaction(async (tx) => {
     const snap = await tx.get(companyRef);
-    const c    = snap.data() || {};
+    const c = snap.data() || {};
 
-    // soft-downgrade if subscription is paused / halted
+    // downgrade to "free" if subscription halted/paused/created
     const tierRaw = c.tier || "free";
-    const tier =
-      ["halted", "paused", "created"].includes(c.subscriptionStatus)
-        ? "free"
-        : tierRaw;
+    const tier = ["halted", "paused", "created"].includes(
+      c.subscriptionStatus
+    )
+      ? "free"
+      : tierRaw;
 
     const monthlyLimit = MESSAGE_LIMITS[tier] ?? 150;
-    let   used         = c.messagesUsedMonth || 0;
-
-    // reset counter if billing cycle ended
-    const end   = c.currentPeriodEnd?.toDate?.();
+    // how many used so far
+    let used = c.messagesUsedMonth || 0;
+    // reset if billing period ended
+    const end = c.currentPeriodEnd?.toDate?.();
     const cycleReset = end && new Date() > end;
-    if (cycleReset) used = 0;
+    if (cycleReset) {
+      used = 0;
+    }
+    // how many extra messages remain
+    const credits = c.overageCredits || 0;
 
-    if (used >= monthlyLimit) return { allowed: false };       // hard stop
+    // if over monthly limit *and* no credits left → block
+    if (used >= monthlyLimit && credits <= 0) {
+      return { allowed: false };
+    }
 
-    tx.update(companyRef, {
-      messagesUsedMonth: used + 1,          // **reserve one slot now**
-      lastMsgAt:         Timestamp.now(),
-      ...(cycleReset && { currentPeriodEnd: null, messagesUsedMonth: 1 }),
-    });
+    // build our update
+    const updates = {
+      messagesUsedMonth: used + 1,
+      lastMsgAt: Timestamp.now(),
+    };
+    if (cycleReset) {
+      updates.currentPeriodEnd = null;
+      updates.messagesUsedMonth = 1;
+    }
+    // if we're beyond the monthly limit, consume one credit
+    if (used >= monthlyLimit && credits > 0) {
+      updates.overageCredits = credits - 1;
+    }
+
+    // reserve
+    tx.update(companyRef, updates);
     return { allowed: true, tier, monthlyLimit };
   });
 
   if (!reserveResult.allowed) {
     return res
       .status(403)
-      .json({ error: "Monthly message limit reached. Please upgrade to continue." });
+      .json({
+        error:
+          "Monthly message limit reached and no overage credits left. Please upgrade to continue.",
+      });
   }
 
-  /* ---------- fetch FAQs (cached by caller if provided) ---------- */
+  /* ─── load FAQs ───────────────────────────────────────────── */
   let faqs = Array.isArray(req.body.faqs) ? req.body.faqs : [];
   try {
     if (!faqs.length) {
@@ -705,104 +761,93 @@ app.post("/api/chat", async (req, res) => {
     faqs = faqs
       .map((f) => ({
         q: (f.q ?? f.question ?? f.title ?? "").toString().trim(),
-        a: (f.a ?? f.answer  ?? "").toString().trim(),
+        a: (f.a ?? f.answer ?? "").toString().trim(),
       }))
       .filter((f) => f.q && f.a);
   } catch (e) {
     console.warn("FAQ fetch failed:", e.message);
   }
 
-  const normalize = (s) =>
-    s.trim().toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ");
+  const stem = (w) => natural.PorterStemmer.stem(w);
 
-  /* ---------- exact FAQ match ---------- */
+  const normalize = (s = "") =>
+    s
+      .toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(stem)           // 🎯 new!
+      .join(" ");
+
+  /* ─── exact FAQ match ─────────────────────────────────────── */
   const exact = faqs.find((f) => normalize(f.q) === normalize(qRaw));
   if (exact) {
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.write(exact.a);
-    return res.end();
+    return res.type("text/plain").send(dedupe(exact.a));
   }
 
-  /* ---------- fuzzy FAQ match ---------- */
+  /* ─── fuzzy FAQ match ─────────────────────────────────────── */
   try {
     const qs = faqs.map((f) => f.q);
     if (qs.length) {
-      const { bestMatch, bestMatchIndex } = stringSimilarity.findBestMatch(qRaw, qs);
-      if (bestMatch?.rating > 0.9) {
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
-        res.write(faqs[bestMatchIndex].a);
-        return res.end();
+      const { bestMatch, bestMatchIndex } = stringSimilarity.findBestMatch(
+        qRaw,
+        qs
+      );
+    const jaccard = (a, b) => {
+     const setA = new Set(a.split(/\s+/));
+     const setB = new Set(b.split(/\s+/));
+     const intersect = [...setA].filter(x => setB.has(x)).length;
+     return intersect / (setA.size + setB.size - intersect);
+    };
+
+    const sim   = bestMatch?.rating ?? 0;
+    const jac   = jaccard(normalize(qRaw), normalize(qs[bestMatchIndex]));
+
+    // hit if EITHER metric is good enough
+    if (sim >= 0.70 || jac >= 0.45) {
+        return res.type("text/plain").send(dedupe(faqs[bestMatchIndex].a));
       }
     }
   } catch (e) {
     console.warn("Fuzzy match failed:", e.message);
   }
 
-  /* ---------- LLM fallback ---------- */
   const faqPrefix = faqs
-    .slice(0, 5)
-    .map((f, i) => `${i + 1}. Q: ${f.q}\n   A: ${f.a}`)
-    .join("\n");
+  .slice(0, 5)
+  .map((f, i) => `${i + 1}. Q: ${f.q}\n   A: ${f.a}`)
+  .join("\n");
 
-  const prompt =
-    (faqs.length
-      ? `You are an AI customer-support assistant.\nUse these FAQs if helpful:\n${faqPrefix}\n\n`
-      : "You are an AI customer-support assistant.\n\n") +
-    `User: ${qRaw}\nAnswer (concise):`;
 
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.setHeader("Transfer-Encoding", "chunked");
-  res.setHeader("Cache-Control", "no-cache");
+  const SYS  = "You are Botify, an AI customer-support assistant. Keep answers ≤ 3 sentences.";
+  const USER = (faqs.length ? `Helpful FAQs:\n${faqPrefix}\n\n` : "") + qRaw;
 
-  let replyText = "";
-  const promptTokens = estTokens(prompt); // legacy metric
-
+  /* ─── LLM fallback (non-stream, deduped) ───────────────────── */
   try {
-    /* ──────────────── 1. Call DeepSeek in streaming mode ──────────────── */
-    const stream = await openai.chat.completions.create({
-      model:    "deepseek-chat",
-      messages: [{ role: "user", content: prompt }],
-      stream:   true,
+    const llm = await openai.chat.completions.create({
+      model: "deepseek-chat",
+      temperature: 0.15,
+      max_tokens: 150,
+      frequency_penalty: 1.2,   // discourages repetition
+      presence_penalty : 0.9,
+      messages: [
+        { role: "system", content: SYS },
+        { role: "user",   content: USER },
+      ],
     });
 
-    /* ──────────────── 2. Proxy chunks to the client ──────────────── */
-    for await (const chunk of stream) {
-      const delta = chunk?.choices?.[0]?.delta?.content || "";
-      if (delta) {
-        replyText += delta;       // assemble full assistant reply
-        res.write(delta);         // stream to browser
-      }
-    }
+    let replyText = llm.choices?.[0]?.message?.content
+                  || "Sorry, I’m not sure.";
+
+    /* wipe 1- to 4-word repeats + glued “wordword” */
+    replyText = dedupe(replyText);
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    return res.type("text/plain").send(replyText);
   } catch (e) {
-    /* Any network / model error -> emit marker so FE can react */
-    console.error("Streaming error:", e);
-    res.write("\n[Error: generation failed]");
-  } finally {
-    /* ──────────────── 3. Telemetry (optional) ────────────────
-      • Message quota was already *reserved* at txn-start, so
-        we DO NOT touch `messagesUsedMonth` again here.
-      • We can still log an *approx* token cost for analytics.
-    ---------------------------------------------------------------- */
-    const approxTokens =
-      promptTokens +                       // prompt that we sent
-      estTokens(replyText);       // assistant response size
-
-    db.collection("companies")
-      .doc(companyId)
-      .update({
-        /* purely legacy stats – safe to drop any time */
-        tokensUsedMonthLegacy: FieldValue.increment(approxTokens),
-      })
-      .catch((err) =>
-        console.warn("Legacy token telemetry failed:", err.message)
-      );
-
-    /* done – flush the response */
-    res.end();
+    console.error("LLM error:", e);
+    return res.status(500).send("Generation failed.");
   }
-
 });
-
 
 /* ===========================================================
    Usage status for widget (now message-based)
@@ -869,6 +914,7 @@ app.post("/api/register-company", async (req, res) => {
       tier: "free",
       messagesUsedMonth: 0,
       createdAt: Timestamp.now(),
+      overageCredits: 0,
     });
 
     await db.collection("users").doc(userId).update({ companyId: companyDoc.id });
@@ -877,6 +923,44 @@ app.post("/api/register-company", async (req, res) => {
   } catch (err) {
     console.error("Company registration error:", err.message);
     res.status(500).json({ error: "Failed to register company." });
+  }
+});
+
+// create-order endpoint
+app.post("/api/billing/create-overage-order", async (req, res) => {
+  const { userId, blocks = 1 } = req.body;
+  if (!userId) return res.status(400).json({ error: "Missing userId" });
+  if (blocks < 1 || blocks > 20)
+    return res.status(400).json({ error: "Invalid blocks (1–20)" });
+
+  // find company & ensure they have an *active* subscription
+  const userSnap = await db.collection("users").doc(userId).get();
+  const companyId = userSnap.data()?.companyId;
+  if (!companyId) return res.status(400).json({ error: "No company linked" });
+
+  const compSnap = await db.collection("companies").doc(companyId).get();
+  const c = compSnap.data() || {};
+  if (c.subscriptionStatus !== "active")
+    return res.status(403).json({ error: "Subscription not active" });
+
+  // build a Razorpay Order
+  const amount = PLAN_CATALOG.overage_1k.amountPaise * blocks; // e.g. 32900 * blocks
+  try {
+    const order = await razorpay.orders.create({
+      amount,
+      currency: "INR",
+      receipt: `overage_${companyId}_${Date.now()}`,
+      notes: { companyId, blocks: blocks.toString() },
+    });
+    return res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      key: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (e) {
+    console.error("create-order error:", e);
+    return res.status(500).json({ error: "Could not create order" });
   }
 });
 
