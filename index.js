@@ -270,7 +270,7 @@ app.post(
       // ─── credit overage when a one-time payment is captured ───
       if (evt === "payment.captured") {
         const pay = event.payload.payment.entity;
-        const notes = pay.notes || {};
+        let notes = pay.notes || {};
         if ((!notes.companyId || !notes.blocks) && pay.order_id) {
           try {
             const order = await razorpay.orders.fetch(pay.order_id);
