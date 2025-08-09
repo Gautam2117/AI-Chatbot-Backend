@@ -49,7 +49,7 @@ const adminCors = cors({
 });
 
 // Make sure preflight gets CORS headers
-pp.options("/api/:path*", publicCors);
+app.options("/api/:path*", publicCors);
 
 // Apply CORS *before* any middlewares/handlers on those routes
 app.use("/api/usage-status", publicCors);
