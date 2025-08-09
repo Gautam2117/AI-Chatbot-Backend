@@ -26,51 +26,36 @@ const PORT = process.env.PORT || 5000;
 app.set("trust proxy", 1);
 
 /* ──────────────────────────────────
-   CORS (public vs admin)
+   CORS (simple + safe)
 ─────────────────────────────────── */
-
-// Public endpoints used by the embeddable widget
 const publicCors = cors({
-  origin: true,                               // reflect any Origin
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","x-user-id"],
-  credentials: false,                         // no cookies
-  optionsSuccessStatus: 204
+  origin: true, // reflect any Origin
+  credentials: false,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-user-id"],
+  optionsSuccessStatus: 204,
 });
 
-// Admin/billing endpoints — only your own apps should call these
 const adminCors = cors({
   origin: [
     "https://ai-chatbot-saas-eight.vercel.app",
-    "http://localhost:5173"
+    "http://localhost:5173",
   ],
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","x-user-id"],
   credentials: true,
-  optionsSuccessStatus: 204
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-user-id"],
+  optionsSuccessStatus: 204,
 });
 
-// ⛔ REMOVE this bad line:
-// app.options("/api/:path*", publicCors);
-
-// ✅ Preflight for public routes
-app.options("/api/usage-status", publicCors);
-app.options("/api/faqs", publicCors);
-app.options("/api/chat", publicCors);
-
-// ✅ Apply CORS to public routes
+// Apply before routes. No app.options(), no wildcards.
 app.use("/api/usage-status", publicCors);
 app.use("/api/faqs",        publicCors);
 app.use("/api/chat",        publicCors);
 
-// ✅ Preflight for admin routes
-app.options("/api/billing/*",       adminCors);
-app.options("/api/register-company", adminCors);
-
-// ✅ Apply CORS to admin routes
 app.use("/api/billing",          adminCors);
 app.use("/api/register-company", adminCors);
 
+// Webhook is server-to-server; CORS not needed
 app.use(helmet());
 
 /* ──────────────────────────────────
