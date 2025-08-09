@@ -26,24 +26,42 @@ const PORT = process.env.PORT || 5000;
 app.set("trust proxy", 1);
 
 /* ──────────────────────────────────
-   CORS
+   CORS (public vs admin)
 ─────────────────────────────────── */
 
-const WHITELIST = [
-  "https://ai-chatbot-saas-eight.vercel.app",
-  "http://localhost:5173",
-];
+// Public endpoints used by the embeddable widget
+const publicCors = cors({
+  origin: true,                                 // reflect any Origin
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type","x-user-id"],
+  credentials: false                            // widget doesn't use cookies
+});
 
-// one single options object
-const corsOptions = {
-  origin: (origin, cb) => cb(null, !origin || WHITELIST.includes(origin)),
-  credentials: true,
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-user-id"],
-  optionsSuccessStatus: 204,
-};
+// Admin/billing endpoints — only your own apps should call these
+const adminCors = cors({
+  origin: [
+    "https://ai-chatbot-saas-eight.vercel.app",
+    "http://localhost:5173"
+  ],
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type","x-user-id"],
+  credentials: true
+});
 
-app.use(cors(corsOptions));  // attach CORS headers
+// Make sure preflight gets CORS headers
+app.options("/api/*", publicCors);
+
+// Apply CORS *before* any middlewares/handlers on those routes
+app.use("/api/usage-status", publicCors);
+app.use("/api/faqs",        publicCors);
+app.use("/api/chat",        publicCors);
+
+// Lock down sensitive routes
+app.use("/api/billing",         adminCors);
+app.use("/api/register-company", adminCors);
+
+// (webhooks are server-to-server; CORS not required)
+
 app.use(helmet());
 
 /* ──────────────────────────────────
