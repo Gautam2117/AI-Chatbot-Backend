@@ -16,9 +16,12 @@ console.log("📆 Scheduling daily reset job (00:00 IST)…");
 
 /* 00:00 IST == 18:30 UTC */
 cron.schedule(
-  "30 18 * * *",
+  "0 0 * * *",
   async () => {
-    const isFirstOfMonth = new Date().getDate() === 1;
+
+    const nowIst = new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" });
+    const d = new Date(nowIst);
+    const isFirstOfMonth = d.getDate() === 1;
     const writer         = db.bulkWriter();          // ⚡️ batched writes
 
     try {

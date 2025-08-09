@@ -81,7 +81,7 @@ const PLAN_CATALOG = {
   },
   starter_yearly:  {
     tier: "starter", period: "yearly",  interval: 1,
-    amountPaise: 1_599_900,                            // ₹15 990.00 (2 mo free)
+    amountPaise: 1_599_000,                            // ₹15 990.00 (2 mo free)
     name: "Botify Starter (3 000 msgs) — Yearly",
     envKey: "RP_PLAN_STARTER_YEARLY",
   },
@@ -138,52 +138,6 @@ const estTokens = (s = "") => Math.ceil(s.length / 4);
    ║                INTERNAL  CRON  JOBS                   ║
    ╚═══════════════════════════════════════════════════════╝ */
 
-app.post(
-  "/internal/overage-run",
-  basicAuth({
-    users: { [process.env.CRON_USER]: process.env.CRON_PASS },
-    challenge: true,
-  }),
-  async (_req, res) => {
-    try {
-      await nightlyOverageJob();
-      res.json({ ok: true });
-    } catch (e) {
-      console.error("Overage CRON error", e);
-      res.status(500).json({ error: e.message });
-    }
-  }
-);
-
-async function nightlyOverageJob() {
-  const snaps = await db.collection("companies").where("subscriptionId", "!=", null).get();
-
-  for (const doc of snaps.docs) {
-    const c       = doc.data();
-    const limit   = MESSAGE_LIMITS[c.tier] ?? 0;
-    const used    = c.messagesUsedMonth || 0;
-    const over    = Math.max(0, used - limit);
-    const blocks  = Math.floor(over / 1_000);
-    if (blocks === 0 || c.isOverageBilled) continue;
-
-    try {
-      await razorpay.addons.create({
-        subscription_id: c.subscriptionId,
-        item: {
-          name:     `Overage ${blocks * 1_000} messages`,
-          amount:   PLAN_CATALOG.overage_1k.amountPaise * blocks,
-          currency: "INR",
-        },
-        quantity: 1,
-      });
-      await doc.ref.update({ isOverageBilled: true });
-      console.log(`💸 Overage billed for ${doc.id}: +${blocks}k`);
-    } catch (e) {
-      console.error("Add-on create failed:", e);
-    }
-  }
-}
-
 /* ╔═══════════════════════════════════════════════════════╗
    ║                   RAZORPAY  WEBHOOK                   ║
    ╚═══════════════════════════════════════════════════════╝ */
@@ -238,13 +192,18 @@ app.post(
         const notes   = inv.notes || {};
         const planKey = notes.planKey;
         const tier    = PLAN_CATALOG[planKey]?.tier || "starter";
-        const interval = planKey.includes("yearly") ? "yearly" : "monthly";
-        const nextAttempt = inv.next_payment_attempt;
-        const endTs   = nextAttempt
-          ? Timestamp.fromDate(new Date(nextAttempt * 1000))
-          : null;
+        const interval = planKey?.includes("yearly") ? "yearly" : "monthly";
 
-        // find the company
+        // PATCH: fetch subscription for true cycle end (current_end / charge_at)
+        let endTs = null;
+        try {
+          const sub = await razorpay.subscriptions.fetch(subId);
+          const epoch = sub.current_end || sub.charge_at || null;
+          if (epoch) endTs = Timestamp.fromDate(new Date(epoch * 1000));
+        } catch (e) {
+          console.warn("Could not fetch subscription for period end:", e?.error?.description || e.message);
+        }
+
         const compSnap = await db
           .collection("companies")
           .where("subscriptionId", "==", subId)
@@ -313,11 +272,18 @@ app.post(
       }
 
       // ─── Log as processed ───
+      // PATCH: log minimally
       await logRef.set({
         ts: Timestamp.now(),
         evt,
         processed: true,
-        raw: event,
+        // minimal pointers only:
+        ids: {
+          subscription: event.payload.subscription?.entity?.id || null,
+          invoice: event.payload.invoice?.entity?.id || null,
+          payment: event.payload.payment?.entity?.id || null,
+        },
+        eventId: req.headers["x-razorpay-event-id"] || null,
       });
     } catch (err) {
       console.error("Webhook handler error:", err);
@@ -326,7 +292,12 @@ app.post(
         evt,
         error: err.message,
         processed: false,
-        raw: event,
+        ids: {
+          subscription: event.payload?.subscription?.entity?.id || null,
+          invoice:      event.payload?.invoice?.entity?.id || null,
+          payment:      event.payload?.payment?.entity?.id || null,
+        },
+        eventId: req.headers["x-razorpay-event-id"] || null,
       });
     }
 
@@ -434,125 +405,89 @@ app.get("/api/billing/plans", (_req, res) => {
   });
 });
 
+// PATCH: extract subscribe logic so switch can reuse it safely
+async function createSubscription({ planKey, userId, companyId, customer }) {
+  if (!planKey) throw Object.assign(new Error("Missing planKey"), { code: 400 });
 
-/* ─────────────────────────  SUBSCRIPTION  HANDLER  ───────────────────────── */
+  // 1) Resolve company
+  const targetCompanyId = companyId || (userId ? await getCompanyIdForUser(userId) : null);
+  if (!targetCompanyId) throw Object.assign(new Error("Missing companyId"), { code: 400 });
+
+  // 2) Reject if already on that exact plan
+  const cSnap = await db.collection("companies").doc(targetCompanyId).get();
+  const existing  = cSnap.data() || {};
+  const currentKey = `${(existing.tier || "free")}_${existing.billingInterval || "monthly"}`;
+  if (currentKey === planKey) throw Object.assign(new Error("Already on that plan"), { code: 400 });
+
+  // 3) Ensure Razorpay plan exists
+  const planId = await getOrCreateRazorpayPlan(planKey);
+
+  // 4) (optional) Create / reuse Razorpay customer
+  let customerId = null;
+  if (customer?.email) {
+    try {
+      const c = await razorpay.customers.create({
+        name:    customer.name || "Botify User",
+        email:   customer.email,
+        contact: customer.contact || undefined,
+        notes:   { companyId: targetCompanyId, userId: userId || "" },
+      });
+      customerId = c.id;
+    } catch {/* best-effort */}
+  }
+
+  // 5) Create subscription
+  const cycles = planKey.includes("yearly") ? 100 /* years */ : 1200 /* months */; // allowed long-lived
+  const sub = await razorpay.subscriptions.create({
+    plan_id:         planId,
+    total_count:     cycles,
+    customer_notify: 1,
+    customer_id:     customerId || undefined,
+    notes:           { planKey, companyId: targetCompanyId, userId: userId || "" },
+  });
+
+  // 6) Persist shell
+  await db.collection("companies").doc(targetCompanyId).set({
+    subscriptionId:     sub.id,
+    subscriptionStatus: sub.status,
+    billingInterval:    planKey.includes("yearly") ? "yearly" : "monthly",
+    currentPeriodEnd:   null,
+  }, { merge: true });
+
+  // 7) Return checkout payload
+  return {
+    subscriptionId: sub.id,
+    shortKey:       planKey,
+    status:         sub.status,
+    checkout: {
+      key:             process.env.RAZORPAY_KEY_ID,
+      subscription_id: sub.id,
+      customer_id:     customerId,
+      name:            "Botify",
+      description:     PLAN_CATALOG[planKey].name,
+      notes:           { planKey, companyId: targetCompanyId },
+    },
+  };
+}
+
+
+// PATCH: subscribe uses helper
 app.post("/api/billing/subscribe", async (req, res) => {
   try {
-    const { planKey, userId, companyId, customer } = req.body;
-    if (!planKey) return res.status(400).json({ error: "Missing planKey" });
-
-    /* 1️⃣  Resolve company */
-    const targetCompanyId =
-      companyId || (userId ? await getCompanyIdForUser(userId) : null);
-    if (!targetCompanyId)
-      return res.status(400).json({ error: "Missing companyId" });
-
-    /* 2️⃣  Reject if already on that exact plan */
-    const cSnap     = await db.collection("companies").doc(targetCompanyId).get();
-    const existing  = cSnap.data() || {};
-    const currentKey = `${(existing.tier || "free")}_${existing.billingInterval || "monthly"}`;
-    if (currentKey === planKey)
-      return res.status(400).json({ error: "Already on that plan" });
-
-    /* 3️⃣  Ensure Razorpay plan exists */
-    const planId = await getOrCreateRazorpayPlan(planKey);
-
-    /* 4️⃣  (optional) Create / reuse Razorpay customer */
-    let customerId = null;
-    if (customer?.email) {
-      try {
-        const c = await razorpay.customers.create({
-          name:    customer.name || "Botify User",
-          email:   customer.email,
-          contact: customer.contact || undefined,
-          notes:   { companyId: targetCompanyId, userId: userId || "" },
-        });
-        customerId = c.id;
-      } catch { /* customer creation is best-effort */ }
-    }
-
-    /* 5️⃣  Create the subscription (auto-renew) */
-    const cycles = planKey.includes("yearly") ? 100 /* years */ : 1200 /* months */;
-    const sub    = await razorpay.subscriptions.create({
-      plan_id:         planId,
-      total_count:     cycles,
-      customer_notify: 1,
-      customer_id:     customerId || undefined,
-      notes:           { planKey, companyId: targetCompanyId, userId: userId || "" },
-    });
-
-    /* 6️⃣  Persist shell in Firestore */
-    await db.collection("companies").doc(targetCompanyId).set({
-      subscriptionId:     sub.id,
-      subscriptionStatus: sub.status,
-      billingInterval: planKey.includes("yearly") ? "yearly" : "monthly",
-      currentPeriodEnd: null,
-    }, { merge: true });
-
-    /* 7️⃣  Return checkout payload */
-    return res.json({
-      subscriptionId: sub.id,
-      shortKey:       planKey,
-      status:         sub.status,
-      checkout: {
-        key:             process.env.RAZORPAY_KEY_ID,
-        subscription_id: sub.id,
-        customer_id:     customerId,
-        name:            "Botify",
-        description:     PLAN_CATALOG[planKey].name,
-        notes:           { planKey, companyId: targetCompanyId },
-      },
-    });
+    const out = await createSubscription(req.body || {});
+    res.json(out);
   } catch (e) {
     console.error("subscribe error:", e);
-    return res.status(500).json({
+    res.status(e.code === 400 ? 400 : 500).json({
       error: e?.error?.description || e.message || "Subscribe failed",
     });
   }
 });
 
-/* ===========================================================
-   One-click add-on: 1 000 extra messages
-=========================================================== */
-app.post("/api/billing/buy-overage", async (req, res) => {
-  const { userId, blocks = 1 } = req.body;           // blocks → 1 k chunks
-  if (!userId)           return res.status(400).json({ error: "Missing userId" });
-  if (blocks < 1 || blocks > 20)
-    return res.status(400).json({ error: "Invalid blocks" });
-
-  try {
-    const companyId = await getCompanyIdForUser(userId);
-    const snap      = await db.collection("companies").doc(companyId).get();
-    const subId     = snap.data()?.subscriptionId;
-    if (!subId) return res.status(400).json({ error: "No active subscription" });
-
-    const addon = await razorpay.addons.create({
-      subscription_id: subId,
-      item: {
-        name: `Pre-paid ${blocks * 1000} messages`,
-        amount: PLAN_CATALOG.overage_1k.amountPaise * blocks,
-        currency: "INR",
-      },
-      quantity: 1,
-    });
-
-    await snap.ref.update({ isOverageBilled: true });
-    return res.json({ ok: true, addonId: addon.id });
-  } catch (e) {
-    const msg =
-      e?.error?.description?.includes("cannot add addon to a subscription in created state")
-        ? "Subscription not active yet – pay the first invoice and try again."
-        : e?.error?.description || e.message;
-    return res.status(400).json({ error: msg });
-  }
-});
-
-/* ===========================================================
-   (Optional) Switch plan (creates a new subscription & cancels old at period end)
-=========================================================== */
+// PATCH: switch cancels old (at period end) then creates new
 app.post("/api/billing/switch", async (req, res) => {
   try {
-    const { planKey, companyId } = req.body;
+    const { planKey, companyId } = req.body || {};
     if (!planKey || !companyId)
       return res.status(400).json({ error: "Missing planKey/companyId" });
 
@@ -566,11 +501,10 @@ app.post("/api/billing/switch", async (req, res) => {
       }
     }
 
-    // reuse /subscribe flow
-    req.body.userId = null;
-    return app._router.handle(req, res, require("finalhandler")(req, res));
+    const out = await createSubscription({ planKey, companyId });
+    res.json(out);
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -597,6 +531,14 @@ app.post("/api/billing/cancel", async (req, res) => {
    FAQs for Widget (unchanged except minor safety)
 =========================================================== */
 const hits = new Map();
+// PATCH: TTL cleanup for IP counters (once per minute)
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, v] of hits) {
+    if (now > (v.resetAt || 0) + 60_000) hits.delete(ip);
+  }
+}, 60_000).unref?.();
+
 app.use("/api/faqs", (req, res, next) => {
   const ip =
     req.ip || req.headers["x-forwarded-for"] || req.connection?.remoteAddress || "unknown";
@@ -609,28 +551,39 @@ app.use("/api/faqs", (req, res, next) => {
   next();
 });
 
+// PATCH: enforce membership and forbid arbitrary companyId pulls
 app.get("/api/faqs", async (req, res) => {
   try {
-    const qUserId = (req.query.userId || req.headers["x-user-id"] || "").toString();
-    const qCompanyId = (req.query.companyId || "").toString();
-    const companyId = qCompanyId || (qUserId ? await getCompanyIdForUser(qUserId) : null);
-    if (!companyId) return res.status(400).json({ error: "Missing userId/companyId" });
+    const qUserId    = (req.query.userId || req.headers["x-user-id"] || "").toString();
+    const reqCompany = (req.query.companyId || "").toString();
+    if (!qUserId) return res.status(401).json({ error: "Auth required (x-user-id)" });
 
+    // resolve user's company
+    const userSnap = await db.collection("users").doc(qUserId).get();
+    if (!userSnap.exists) return res.status(404).json({ error: "User not found" });
+    const userCompanyId = userSnap.data()?.companyId;
+    if (!userCompanyId) return res.status(400).json({ error: "User not linked to company" });
+
+    // if a companyId was supplied, it MUST match the user's company
+    if (reqCompany && reqCompany !== userCompanyId)
+      return res.status(403).json({ error: "Forbidden for this company" });
+
+    const companyId = userCompanyId;
     const snap = await db.collection("faqs").doc(companyId).collection("list").limit(200).get();
-    const faqs = snap.docs
-      .map((d) => {
-        const x = d.data();
-        const q = (x.q ?? x.question ?? x.title ?? "").toString().trim();
-        const a = (x.a ?? x.answer ?? "").toString().trim();
-        return q && a ? { question: q, answer: a } : null;
-      })
-      .filter(Boolean);
+
+    let faqs = snap.docs.map((d) => {
+      const x = d.data();
+      const q = (x.q ?? x.question ?? x.title ?? "").toString().trim();
+      const a = (x.a ?? x.answer ?? "").toString().trim();
+      return q && a ? { id: d.id, question: q, answer: a } : null;
+    }).filter(Boolean)
+     .sort((a,b)=> a.id.localeCompare(b.id)); // PATCH: stable order for ETag
 
     const etag = crypto.createHash("sha1").update(JSON.stringify(faqs)).digest("hex");
     if (req.headers["if-none-match"] === etag) return res.status(304).end();
 
     res.setHeader("ETag", etag);
-    res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
+    res.setHeader("Cache-Control", "private, max-age=60, stale-while-revalidate=120");
     return res.json(faqs);
   } catch (e) {
     return res.status(500).json({ error: e.message || "Failed to fetch FAQs" });
@@ -663,7 +616,8 @@ app.post("/api/chat", async (req, res) => {
   });
 
   /* ─── validate input ────────────────────────────────────── */
-  const userId = req.headers["x-user-id"] || "test-user";
+  const userId = req.headers["x-user-id"];
+  if (!userId) return res.status(401).json({ error: "Auth required (x-user-id)" });
   const qRaw = typeof req.body.question === "string"
     ? req.body.question.trim()
     : "";
@@ -732,6 +686,7 @@ app.post("/api/chat", async (req, res) => {
     const updates = {
       messagesUsedMonth: used + 1,
       lastMsgAt: Timestamp.now(),
+      messagesUsedToday: (c.messagesUsedToday || 0) + 1,
     };
     if (cycleReset) {
       updates.currentPeriodEnd = null;
