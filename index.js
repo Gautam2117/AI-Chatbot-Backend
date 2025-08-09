@@ -899,7 +899,7 @@ app.post("/api/register-company", async (req, res) => {
       overageCredits: 0,
     });
 
-    await db.collection("users").doc(userId).update({ companyId: companyDoc.id });
+    await db.collection("users").doc(userId).set({ companyId: companyDoc.id }, { merge: true });
 
     res.json({ message: "Company registered & user linked.", companyId: companyDoc.id });
   } catch (err) {
