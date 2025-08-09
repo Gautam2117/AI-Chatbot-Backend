@@ -828,28 +828,33 @@ app.get("/api/usage-status", async (req, res) => {
   const c = cSnap.data();
   if (!c) return res.status(404).json({ error: "Company not found" });
 
-  let tier = c.tier || "free";
-  const limit = MESSAGE_LIMITS[tier] ?? 150;
-  const used = c.messagesUsedMonth || 0;
+  let tier = (c.tier || "free").toLowerCase();
+  const limit = (MESSAGE_LIMITS[tier] ?? 150);
+  const used  = c.messagesUsedMonth || 0;
 
-  // Safety: if cycle ended, show 0 used
   const cycleEnd = c.currentPeriodEnd?.toDate?.();
-  const reset = cycleEnd && new Date() > cycleEnd;
-  const usage = reset ? 0 : used;
+  const reset    = cycleEnd && new Date() > cycleEnd;
+  const usage    = reset ? 0 : used;
 
-  // If past_due/halted, block paid features
-  const blocked =
-    (tier === "free" && usage >= limit) ||
-    ["past_due", "halted", "paused"].includes(c.subscriptionStatus || "");
+  const status   = (c.subscriptionStatus || "").toLowerCase();
+  const credits  = c.overageCredits || 0;
+
+  // align with /api/chat: block ONLY if out of messages AND no credits,
+  // or if the subscription is not usable.
+  const hardBlockStatuses = new Set(["past_due", "halted", "paused", "created"]); // include "created" if you want pending to block
+  const blocked = hardBlockStatuses.has(status) || (usage >= limit && credits <= 0);
 
   return res.json({
     usage,
     limit,
     blocked,
+    blockedReason: blocked
+      ? (hardBlockStatuses.has(status) ? `sub_${status}` : (credits <= 0 ? "quota_exhausted" : ""))
+      : null,
     subscriptionStatus: c.subscriptionStatus || null,
     currentPeriodEnd: c.currentPeriodEnd || null,
     tier,
-    overageCredits: c.overageCredits || 0,
+    overageCredits: credits,
   });
 });
 
