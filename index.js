@@ -449,7 +449,7 @@ async function createSubscription({ planKey, userId, companyId, customer }) {
   }
 
   // 5) Create subscription
-  const cycles = planKey.includes("yearly") ? 100 /* years */ : 1200 /* months */; // allowed long-lived
+  const cycles = planKey.includes("yearly") ? 10 /* years */ : 120 /* months */; // allowed long-lived
   const sub = await razorpay.subscriptions.create({
     plan_id:         planId,
     total_count:     cycles,
