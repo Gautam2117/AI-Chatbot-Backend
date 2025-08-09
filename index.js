@@ -204,8 +204,9 @@ app.post(
       return res.status(400).send("Bad raw body");
     }
     const expected = crypto.createHmac("sha256", secret).update(raw).digest("hex");
-    if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sigHdr))) {
-      return res.status(400).send("Invalid signature");
+    const a = Buffer.from(expected);
+    const b = Buffer.from(sigHdr || "");
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {   return res.status(400).send("Invalid signature");
     }
 
     // 2️⃣ Parse event
@@ -270,6 +271,14 @@ app.post(
       if (evt === "payment.captured") {
         const pay = event.payload.payment.entity;
         const notes = pay.notes || {};
+        if ((!notes.companyId || !notes.blocks) && pay.order_id) {
+          try {
+            const order = await razorpay.orders.fetch(pay.order_id);
+            notes = order.notes || notes;
+          } catch (e) {
+            console.warn("Could not fetch order for notes:", e?.error?.description || e.message);
+          }
+        }        
         if (notes.companyId && notes.blocks) {
           const compRef = db.collection("companies").doc(notes.companyId);
           await compRef.update({
@@ -885,6 +894,7 @@ app.get("/api/usage-status", async (req, res) => {
     subscriptionStatus: c.subscriptionStatus || null,
     currentPeriodEnd: c.currentPeriodEnd || null,
     tier,
+    overageCredits: c.overageCredits || 0,
   });
 });
 
