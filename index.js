@@ -31,10 +31,11 @@ app.set("trust proxy", 1);
 
 // Public endpoints used by the embeddable widget
 const publicCors = cors({
-  origin: true,                                 // reflect any Origin
+  origin: true,                               // reflect any Origin
   methods: ["GET","POST","OPTIONS"],
   allowedHeaders: ["Content-Type","x-user-id"],
-  credentials: false                            // widget doesn't use cookies
+  credentials: false,                         // no cookies
+  optionsSuccessStatus: 204
 });
 
 // Admin/billing endpoints — only your own apps should call these
@@ -45,22 +46,30 @@ const adminCors = cors({
   ],
   methods: ["GET","POST","OPTIONS"],
   allowedHeaders: ["Content-Type","x-user-id"],
-  credentials: true
+  credentials: true,
+  optionsSuccessStatus: 204
 });
 
-// Make sure preflight gets CORS headers
-app.options("/api/:path*", publicCors);
+// ⛔ REMOVE this bad line:
+// app.options("/api/:path*", publicCors);
 
-// Apply CORS *before* any middlewares/handlers on those routes
+// ✅ Preflight for public routes
+app.options("/api/usage-status", publicCors);
+app.options("/api/faqs", publicCors);
+app.options("/api/chat", publicCors);
+
+// ✅ Apply CORS to public routes
 app.use("/api/usage-status", publicCors);
 app.use("/api/faqs",        publicCors);
 app.use("/api/chat",        publicCors);
 
-// Lock down sensitive routes
-app.use("/api/billing",         adminCors);
-app.use("/api/register-company", adminCors);
+// ✅ Preflight for admin routes
+app.options("/api/billing/*",       adminCors);
+app.options("/api/register-company", adminCors);
 
-// (webhooks are server-to-server; CORS not required)
+// ✅ Apply CORS to admin routes
+app.use("/api/billing",          adminCors);
+app.use("/api/register-company", adminCors);
 
 app.use(helmet());
 
