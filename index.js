@@ -16,7 +16,6 @@ import crypto             from "crypto";
 import { Timestamp, FieldValue } from "firebase-admin/firestore";
 import { db }             from "./firebase.js";
 import stringSimilarity   from "string-similarity";
-import basicAuth          from "express-basic-auth";
 import natural from "natural";
 
 dotenv.config();
@@ -57,6 +56,21 @@ app.use("/api/register-company", adminCors);
 
 // Webhook is server-to-server; CORS not needed
 app.use(helmet());
+
+// top of server.js
+let FX = { INR_USD: 0.0120, ts: 0 }; // fallback
+async function getFxINRtoUSD() {
+  const STALE_MS = 12 * 60 * 60 * 1000; // 12h
+  if (Date.now() - FX.ts < STALE_MS) return FX.INR_USD;
+  try {
+    // any free FX endpoint; replace with your preferred provider
+    const r = await fetch("https://api.exchangerate.host/latest?base=INR&symbols=USD");
+    const j = await r.json();
+    const rate = Number(j?.rates?.USD);
+    if (rate > 0) FX = { INR_USD: rate, ts: Date.now() };
+  } catch {}
+  return FX.INR_USD;
+}
 
 /* ──────────────────────────────────
    Razorpay client
@@ -126,6 +140,14 @@ const PLAN_CATALOG = {
     envKey: "RP_PLAN_SCALE_YEARLY",
   },
 
+  /* Starter Lite – 1 500 msgs / mo (branding kept) */
+  starterlite_monthly: {
+    tier: "starterlite", period: "monthly", interval: 1,
+    amountPaise: 49_900,                               // ₹499.00
+    name: "Botify Starter Lite (1 500 msgs) — Monthly",
+    envKey: "RP_PLAN_STARTERLITE_MONTHLY",
+  },
+
   /* Overage add-on */
   overage_1k: {
     name: "Overage 1 000 messages",
@@ -137,18 +159,50 @@ const PLAN_CATALOG = {
    Monthly hard caps
 ─────────────────────────────────── */
 const MESSAGE_LIMITS = {
-  free:    150,
+  // Free mode decided below; default will be overridden by FREE_MODE flag
+  free:    1000,
   starter: 3_000,
   growth:  15_000,
   scale:   50_000,
+  starterlite: 1_500,
 };
 
 /* helper – rough token estimator (legacy analytics) */
 const estTokens = (s = "") => Math.ceil(s.length / 4);
 
-/* ╔═══════════════════════════════════════════════════════╗
-   ║                INTERNAL  CRON  JOBS                   ║
-   ╚═══════════════════════════════════════════════════════╝ */
+// Free mode switch:
+//   "trial"  => 14-day unlimited trial with branding
+//   "free"   => forever free 1,000 msgs/mo with branding
+const FREE_MODE = (process.env.FREE_MODE || "free").toLowerCase(); // "trial" | "free"
+
+// Helper to check active trial
+function trialActive(c) {
+  const ends = c?.trialEndsAt?.toDate?.();
+  return FREE_MODE === "trial" && ends && new Date() < ends;
+}
+
+// Optional: call once to start a 14-day trial
+app.post("/api/billing/start-trial", async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    if (FREE_MODE !== "trial") return res.status(400).json({ error: "Trial mode disabled" });
+    if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+    const userSnap = await db.collection("users").doc(userId).get();
+    const companyId = userSnap.data()?.companyId;
+    if (!companyId) return res.status(400).json({ error: "No company" });
+
+    const compRef = db.collection("companies").doc(companyId);
+    const comp = (await compRef.get()).data() || {};
+    if (trialActive(comp)) return res.json({ ok: true, alreadyActive: true });
+
+    const ends = Timestamp.fromDate(new Date(Date.now() + 14 * 86400_000));
+    await compRef.set({ trialEndsAt: ends, tier: comp.tier || "free" }, { merge: true });
+    res.json({ ok: true, trialEndsAt: ends });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 /* ╔═══════════════════════════════════════════════════════╗
    ║                   RAZORPAY  WEBHOOK                   ║
@@ -369,19 +423,32 @@ async function getOrCreateRazorpayPlan (planKey) {
 
 app.get("/", (_req, res) => res.send("✅ Botify backend running."));
 
-app.get("/api/billing/plans", (_req, res) => {
-  const toRs = (p) => Math.round(p / 100);
+app.get("/api/billing/plans", async (req, res) => {
+  const toRs  = (p) => Math.round(p / 100);
+  const inrToUsd = await getFxINRtoUSD(); // uses your cached FX helper
+  const inUSD = (rs) => Math.round((rs * inrToUsd) * 100) / 100; // round to 2dp
+
+  // Hard anchors for marketing parity (optional): override to nice numbers
+  const prettyUSD = {
+    starter_m: 19, growth_m: 59, scale_m: 149, starterlite_m: 5.99,
+    // yearly ~17% off (10× monthly), adjust if you prefer exact FX
+    starter_y: 190, growth_y: 590, scale_y: 1490
+  };
+
   res.json({
     currency: "INR",
+    freeMode: FREE_MODE, // "trial" | "free"
 
     starter: {
       monthly: {
-        price:    toRs(PLAN_CATALOG.starter_monthly.amountPaise),
+        priceINR: toRs(PLAN_CATALOG.starter_monthly.amountPaise),
+        priceUSD: prettyUSD.starter_m,
         messages: 3_000,
         planKey:  "starter_monthly",
       },
       yearly: {
-        price:    toRs(PLAN_CATALOG.starter_yearly.amountPaise),
+        priceINR: toRs(PLAN_CATALOG.starter_yearly.amountPaise),
+        priceUSD: prettyUSD.starter_y,
         messages: 3_000,
         planKey:  "starter_yearly",
       },
@@ -389,12 +456,14 @@ app.get("/api/billing/plans", (_req, res) => {
 
     growth: {
       monthly: {
-        price:    toRs(PLAN_CATALOG.growth_monthly.amountPaise),
+        priceINR: toRs(PLAN_CATALOG.growth_monthly.amountPaise),
+        priceUSD: prettyUSD.growth_m,
         messages: 15_000,
         planKey:  "growth_monthly",
       },
       yearly: {
-        price:    toRs(PLAN_CATALOG.growth_yearly.amountPaise),
+        priceINR: toRs(PLAN_CATALOG.growth_yearly.amountPaise),
+        priceUSD: prettyUSD.growth_y,
         messages: 15_000,
         planKey:  "growth_yearly",
       },
@@ -402,23 +471,37 @@ app.get("/api/billing/plans", (_req, res) => {
 
     scale: {
       monthly: {
-        price:    toRs(PLAN_CATALOG.scale_monthly.amountPaise),
+        priceINR: toRs(PLAN_CATALOG.scale_monthly.amountPaise),
+        priceUSD: prettyUSD.scale_m,
         messages: 50_000,
         planKey:  "scale_monthly",
       },
       yearly: {
-        price:    toRs(PLAN_CATALOG.scale_yearly.amountPaise),
+        priceINR: toRs(PLAN_CATALOG.scale_yearly.amountPaise),
+        priceUSD: prettyUSD.scale_y,
         messages: 50_000,
         planKey:  "scale_yearly",
       },
     },
 
-    overage: { per_1k: toRs(PLAN_CATALOG.overage_1k.amountPaise) },
+    starterlite: {
+      monthly: {
+        priceINR: toRs(PLAN_CATALOG.starterlite_monthly.amountPaise),
+        priceUSD: prettyUSD.starterlite_m,
+        messages: 1_500,
+        planKey:  "starterlite_monthly",
+      },
+    },
+
+    overage: {
+      per_1kINR: toRs(PLAN_CATALOG.overage_1k.amountPaise),
+      per_1kUSD: Math.round((toRs(PLAN_CATALOG.overage_1k.amountPaise) * inrToUsd) * 100) / 100,
+    },
   });
 });
 
 // PATCH: extract subscribe logic so switch can reuse it safely
-async function createSubscription({ planKey, userId, companyId, customer }) {
+async function createSubscription({ planKey, userId, companyId, customer, coupon }) {
   if (!planKey) throw Object.assign(new Error("Missing planKey"), { code: 400 });
 
   // 1) Resolve company
@@ -450,13 +533,28 @@ async function createSubscription({ planKey, userId, companyId, customer }) {
 
   // 5) Create subscription
   const cycles = planKey.includes("yearly") ? 10 /* years */ : 120 /* months */; // allowed long-lived
-  const sub = await razorpay.subscriptions.create({
+  // Coupons:
+  // PH2MFREE  -> trial_days: 60
+  // FOUNDER50 -> apply Offer if RP_OFFER_FOUNDER50 is set
+  // AGENCY20  -> apply Offer if RP_OFFER_AGENCY20 is set (recurring)
+  const notes = { planKey, companyId: targetCompanyId, userId: userId || "", coupon: coupon || "" };
+  const createPayload = {
     plan_id:         planId,
     total_count:     cycles,
     customer_notify: 1,
     customer_id:     customerId || undefined,
-    notes:           { planKey, companyId: targetCompanyId, userId: userId || "" },
-  });
+    notes,
+  };
+
+  if ((coupon || "").toUpperCase() === "PH2MFREE") {
+    createPayload.trial_days = 60;
+  } else if ((coupon || "").toUpperCase() === "FOUNDER50" && process.env.RP_OFFER_FOUNDER50) {
+    createPayload.offer_id = process.env.RP_OFFER_FOUNDER50;
+  } else if ((coupon || "").toUpperCase() === "AGENCY20" && process.env.RP_OFFER_AGENCY20) {
+    createPayload.offer_id = process.env.RP_OFFER_AGENCY20;
+  }
+
+  const sub = await razorpay.subscriptions.create(createPayload);
 
   // 6) Persist shell
   await db.collection("companies").doc(targetCompanyId).set({
@@ -481,7 +579,6 @@ async function createSubscription({ planKey, userId, companyId, customer }) {
     },
   };
 }
-
 
 // PATCH: subscribe uses helper
 app.post("/api/billing/subscribe", async (req, res) => {
@@ -677,7 +774,11 @@ app.post("/api/chat", async (req, res) => {
       ? "free"
       : tierRaw;
 
-    const monthlyLimit = MESSAGE_LIMITS[tier] ?? 150;
+    // Trial overrides limit
+    const monthlyLimit = trialActive(c)
+      ? Number.POSITIVE_INFINITY
+      : (MESSAGE_LIMITS[tier] ?? MESSAGE_LIMITS.free);
+
     // how many used so far
     let used = c.messagesUsedMonth || 0;
     // reset if billing period ended
@@ -841,7 +942,7 @@ app.get("/api/usage-status", async (req, res) => {
   if (!c) return res.status(404).json({ error: "Company not found" });
 
   let tier = (c.tier || "free").toLowerCase();
-  const limit = (MESSAGE_LIMITS[tier] ?? 150);
+  const limit = trialActive(c) ? Number.POSITIVE_INFINITY : (MESSAGE_LIMITS[tier] ?? MESSAGE_LIMITS.free);
   const used  = c.messagesUsedMonth || 0;
 
   const cycleEnd = c.currentPeriodEnd?.toDate?.();
